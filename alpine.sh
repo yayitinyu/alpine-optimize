@@ -107,7 +107,12 @@ bootstrap_repo() {
         echo "错误：下载后仍缺少脚本文件。" >&2
         exit 1
     }
-    exec bash "${dest}/alpine.sh" "$@"
+    # Re-attach stdin to the terminal so the menu can accept keypresses after curl|bash.
+    if [[ -e /dev/tty ]]; then
+        exec bash "${dest}/alpine.sh" "$@" </dev/tty
+    else
+        exec bash "${dest}/alpine.sh" "$@"
+    fi
 }
 
 ROOT_DIR="$(resolve_root_dir || true)"
@@ -250,7 +255,7 @@ main_menu() {
     while true; do
         show_main_menu
         local choice
-        read -r -p "请选择: " choice || true
+        ask choice "请选择: "
         case "$choice" in
             0) do_all; pause ;;
             1) optimize_menu ;;

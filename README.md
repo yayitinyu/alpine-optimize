@@ -48,6 +48,8 @@ curl -fsSL https://raw.githubusercontent.com/yayitinyu/alpine-optimize/main/alpi
   | bash -s -- socks uninstall --yes
 ```
 
+交互菜单会从 `/dev/tty` 读键盘。`curl | bash` 打开菜单后应能直接选数字；若仍异常，用已经落下的本地副本：
+
 首次远程执行会把仓库落到 `/opt/alpine-optimize`，之后可直接：
 
 ```bash

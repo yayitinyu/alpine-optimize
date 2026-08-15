@@ -82,10 +82,27 @@ can_prompt() {
     [[ -e /dev/tty ]] && { : </dev/tty; } 2>/dev/null
 }
 
+# Interactive prompts must read the real terminal. curl|bash leaves stdin on the
+# pipe, so a normal `read` immediately gets EOF and menus spin on "无效选择".
+ask() {
+    local destvar="$1"
+    local prompt="${2:-}"
+    local reply=""
+
+    if [[ -e /dev/tty ]]; then
+        [[ -n "$prompt" ]] && printf '%s' "$prompt" >/dev/tty
+        IFS= read -r reply </dev/tty || true
+    else
+        [[ -n "$prompt" ]] && printf '%s' "$prompt"
+        IFS= read -r reply || true
+    fi
+    printf -v "$destvar" '%s' "$reply"
+}
+
 confirm() {
     local prompt="$1"
     local default="${2:-y}"
-    local answer
+    local answer hint
 
     if [[ "${ASSUME_YES:-0}" == "1" || "${ASSUME_YES:-}" == "yes" ]]; then
         return 0
@@ -96,21 +113,14 @@ confirm() {
     fi
 
     if [[ "$default" == "y" || "$default" == "yes" ]]; then
-        if can_prompt && [[ ! -t 0 ]]; then
-            printf '%s [Y/n]: ' "$prompt" >/dev/tty
-            IFS= read -r answer </dev/tty || true
-        else
-            read -r -p "${prompt} [Y/n]: " answer || true
-        fi
-        answer="${answer:-y}"
+        hint=" [Y/n]: "
     else
-        if can_prompt && [[ ! -t 0 ]]; then
-            printf '%s [y/N]: ' "$prompt" >/dev/tty
-            IFS= read -r answer </dev/tty || true
-        else
-            read -r -p "${prompt} [y/N]: " answer || true
-        fi
-        answer="${answer:-n}"
+        hint=" [y/N]: "
+    fi
+    ask answer "${prompt}${hint}"
+    if [[ -z "$answer" ]]; then
+        [[ "$default" == "y" || "$default" == "yes" ]] && return 0
+        return 1
     fi
 
     case "$answer" in
@@ -178,8 +188,15 @@ require_openrc() {
 pause() {
     [[ "${NONINTERACTIVE:-0}" == "1" ]] && return 0
     echo
-    read -r -n 1 -s -p "按任意键继续..." || true
-    echo
+    if [[ -e /dev/tty ]]; then
+        printf '按任意键继续...' >/dev/tty
+        IFS= read -r -n 1 -s _ </dev/tty || true
+        printf '\n' >/dev/tty
+    else
+        printf '按任意键继续...'
+        IFS= read -r -n 1 -s _ || true
+        echo
+    fi
 }
 
 register_temp() {

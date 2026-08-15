@@ -1582,10 +1582,16 @@ confirm_uninstall() {
     local reply
 
     ((ASSUME_YES == 1)) && return 0
-    [[ -t 0 ]] || die "非交互环境卸载请显式添加 --yes。"
+    if [[ ! -t 0 && ! -e /dev/tty ]]; then
+        die "非交互环境卸载请显式添加 --yes。"
+    fi
 
     printf '将停止并删除 socks5-node 服务、规则、凭据和托管账号。继续？[y/N] '
-    read -r reply
+    if [[ -e /dev/tty ]]; then
+        IFS= read -r reply </dev/tty || true
+    else
+        IFS= read -r reply || true
+    fi
     [[ "$reply" =~ ^[Yy]$ ]]
 }
 

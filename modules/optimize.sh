@@ -171,7 +171,7 @@ prompt_bandwidth_and_region() {
     echo "3) 使用默认 1000 Mbps"
     echo
     local choice tier custom rchoice buf
-    read -r -p "请选择 [1]: " choice || true
+    ask choice "请选择 [1]: "
     choice="${choice:-1}"
     case "$choice" in
         1)
@@ -179,7 +179,7 @@ prompt_bandwidth_and_region() {
             echo "  a) 100 Mbps   b) 200 Mbps   c) 300 Mbps"
             echo "  d) 500 Mbps   e) 700 Mbps   f) 1 Gbps (推荐)"
             echo "  g) 1.5 Gbps   h) 2 Gbps     i) 2.5 Gbps"
-            read -r -p "请选择档位 [f]: " tier || true
+            ask tier "请选择档位 [f]: "
             tier="${tier:-f}"
             case "$tier" in
                 a) BANDWIDTH_MBPS=100 ;;
@@ -195,7 +195,7 @@ prompt_bandwidth_and_region() {
             ;;
         2)
             while true; do
-                read -r -p "请输入上传带宽 (Mbps): " custom || true
+                ask custom "请输入上传带宽 (Mbps): "
                 if [[ "$custom" =~ ^[0-9]+$ ]] && (( custom > 0 && custom <= 100000 )); then
                     BANDWIDTH_MBPS="$custom"
                     break
@@ -212,7 +212,7 @@ prompt_bandwidth_and_region() {
     echo "服务器主要服务的客户端地区："
     echo "1) 亚太（港/日/新/韩等，RTT 较低）推荐"
     echo "2) 美国/欧洲（跨洋高延迟，更大缓冲区）"
-    read -r -p "请选择 [1]: " rchoice || true
+    ask rchoice "请选择 [1]: "
     rchoice="${rchoice:-1}"
     case "$rchoice" in
         2) REGION="overseas" ;;
@@ -536,7 +536,7 @@ do_time_sync() {
         fi
     elif [[ "$NONINTERACTIVE" -eq 0 ]]; then
         local tz
-        read -r -p "时区（留空跳过，例如 Asia/Shanghai）: " tz || true
+        ask tz "时区（留空跳过，例如 Asia/Shanghai）: "
         if [[ -n "$tz" && -f "/usr/share/zoneinfo/${tz}" ]]; then
             TIMEZONE="$tz"
             cp -f "/usr/share/zoneinfo/${tz}" /etc/localtime
@@ -1088,7 +1088,7 @@ optimize_menu() {
         echo "  q) 返回"
         echo "────────────────────────────────────────"
         local choice
-        read -r -p "请选择: " choice || true
+        ask choice "请选择: "
         case "$choice" in
             0) do_all; pause ;;
             1) do_bbr_network_tune; pause ;;
