@@ -1,0 +1,6 @@
+*.bak
+*.alpine.bak
+*~
+.DS_Store
+Thumbs.db
+*.swp
