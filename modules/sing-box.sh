@@ -33,6 +33,7 @@ SB_LISTEN="${SB_LISTEN:-}"
 ENABLE_WARP="${ENABLE_WARP:-true}"
 WARP_KEEPALIVE_INTERVAL="${WARP_KEEPALIVE_INTERVAL:-25}"
 CLI_FORCE=0
+SB_DID_MIGRATE=0
 STATE_VERSION=""
 SBP_PARSED_HOST=""
 SBP_PARSED_PORT=""
@@ -790,7 +791,9 @@ load_sb_state() {
 }
 
 migrate_legacy_state() {
+    SB_DID_MIGRATE=0
     [[ "${STATE_VERSION:-1}" == "2" && -n "${ANYTLS_PWD:-}" && -n "${PORT_ANYTLS:-}" ]] && return 0
+    SB_DID_MIGRATE=1
     info "检测到旧版 4 协议节点，正在迁移为 VLESS + AnyTLS。"
     [[ -n "${PORT_VLESS:-}" ]] || PORT_VLESS="$(choose_random_port)"
     [[ -n "${PORT_ANYTLS:-}" ]] || PORT_ANYTLS="$(choose_random_port)"
@@ -908,7 +911,7 @@ singbox_install() {
     singbox_prepare
     if [[ -f "$SB_STATE" && "$CLI_FORCE" -ne 1 ]]; then
         load_sb_state
-        if [[ "${STATE_VERSION:-1}" != "2" || -z "${ANYTLS_PWD:-}" ]]; then
+        if ((SB_DID_MIGRATE == 1)); then
             info "正在按新方案重建配置（保留 VLESS 凭证）..."
             ensure_system_user "$SB_USER"
             ensure_warp_profile || true
