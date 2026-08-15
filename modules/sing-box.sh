@@ -23,7 +23,7 @@ SB_SERVICE="${SB_SERVICE:-alpine-sing-box}"
 SB_INIT="/etc/init.d/${SB_SERVICE}"
 SB_LOG="${SB_LOG:-/var/log/alpine-sing-box.log}"
 SB_USER="${SB_USER:-sing-box}"
-MANAGED_MARKER="# Managed by alpine-optimize sing-box"
+SB_MANAGED_MARKER="# Managed by alpine-optimize sing-box"
 
 SB_HOST="${SB_HOST:-}"
 SB_SNI="${SB_SNI:-www.tokyometro.jp}"
@@ -810,7 +810,7 @@ migrate_legacy_state() {
 write_sb_init() {
     write_file "$SB_INIT" 0755 <<EOF
 #!/sbin/openrc-run
-${MANAGED_MARKER}
+${SB_MANAGED_MARKER}
 
 name="${SB_SERVICE}"
 description="Alpine Optimize sing-box"

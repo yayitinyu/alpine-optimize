@@ -20,7 +20,7 @@ REALM_SERVICE_FILE="${REALM_SERVICE_FILE:-/etc/init.d/realm}"
 REALM_SERVICE_NAME="${REALM_SERVICE_NAME:-realm}"
 REALM_USER="${REALM_USER:-realm}"
 REALM_LOG="${REALM_LOG:-/var/log/realm.log}"
-MANAGED_MARKER="# Managed by alpine-optimize realm"
+REALM_MANAGED_MARKER="# Managed by alpine-optimize realm"
 
 LAST_TEMP_DIR=""
 TEMP_DIRS=()
@@ -197,7 +197,7 @@ render_config() {
     esac
 
     {
-        printf '%s\n' "$MANAGED_MARKER"
+        printf '%s\n' "$REALM_MANAGED_MARKER"
         printf '%s\n\n' "# Use alpine.sh realm to add or delete routes; manual changes may be overwritten."
         printf '[log]\nlevel = "warn"\noutput = "stdout"\n\n'
         printf '[network]\nno_tcp = %s\nuse_udp = %s\n\n' "$no_tcp" "$use_udp"
@@ -220,7 +220,9 @@ read_protocol() {
 
 is_managed_file() {
     local path="$1"
-    [[ -f "$path" ]] && grep -Fqx "$MANAGED_MARKER" "$path"
+    # Accept the realm marker, plus the sing-box marker that an earlier
+    # alpine.sh global-variable clash accidentally wrote into Realm files.
+    [[ -f "$path" ]] && grep -Eqx '# Managed by alpine-optimize (realm|sing-box)' "$path"
 }
 
 is_installed() {
@@ -427,7 +429,7 @@ write_service_file() {
     {
         cat <<EOF
 #!/sbin/openrc-run
-${MANAGED_MARKER}
+${REALM_MANAGED_MARKER}
 
 name="${REALM_SERVICE_NAME}"
 description="Realm network relay"
@@ -666,7 +668,7 @@ delete_command() {
     local id="${1:-}" tmp_dir candidate awk_status=0
     realm_prepare
     ensure_managed_install
-    [[ "$id" =~ ^[0-9]+$ ]] || die "请提供要删除的数字 ID。"
+    [[ "$id" =~ ^[0-9]+$ ]] || { error "请提供要删除的数字 ID。"; return 1; }
 
     realm_temp_dir
     tmp_dir="$LAST_TEMP_DIR"
@@ -789,8 +791,11 @@ uninstall_command() {
 
 realm_menu() {
     local choice
-    printf '%sRealm 端口转发管理器 v%s (OpenRC)%s\n' "$C_BLUE" "$REALM_SCRIPT_VERSION" "$C_RESET"
-    cat <<'EOF'
+    while true; do
+        echo
+        printf '%sRealm 端口转发管理器 v%s (OpenRC)%s\n' "$C_BLUE" "$REALM_SCRIPT_VERSION" "$C_RESET"
+        cat <<'EOF'
+────────────────────────────────────────
   1) 安装/修复 Realm
   2) 添加转发规则
   3) 删除转发规则
@@ -799,21 +804,28 @@ realm_menu() {
   6) 更新 Realm
   7) 查看日志
   8) 卸载（保留配置）
-  0) 返回
+  0) 返回主菜单
+────────────────────────────────────────
 EOF
-    prompt_value choice "请选择" "1"
-    case "$choice" in
-        1) install_command ;;
-        2) add_command ;;
-        3) list_command; prompt_value choice "请输入要删除的规则 ID" ""; delete_command "$choice" ;;
-        4) status_command ;;
-        5) protocol_command ;;
-        6) update_command ;;
-        7) logs_command ;;
-        8) uninstall_command ;;
-        0) return 0 ;;
-        *) die "无效选择：$choice" ;;
-    esac
+        ask choice "请选择: "
+        case "$choice" in
+            1) install_command; pause ;;
+            2) add_command; pause ;;
+            3)
+                list_command
+                ask choice "请输入要删除的规则 ID: "
+                delete_command "$choice"
+                pause
+                ;;
+            4) status_command; pause ;;
+            5) protocol_command; pause ;;
+            6) update_command; pause ;;
+            7) logs_command; pause ;;
+            8) uninstall_command; pause ;;
+            0|q|Q) return 0 ;;
+            *) warn "无效选择"; sleep 1 ;;
+        esac
+    done
 }
 
 realm_main() {

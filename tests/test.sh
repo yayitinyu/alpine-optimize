@@ -132,7 +132,7 @@ assert_file_contains "$config" "no_tcp = false" "TCP config enables TCP"
 assert_file_contains "$config" "use_udp = false" "TCP config disables UDP"
 assert_file_contains "$config" 'listen = "0.0.0.0:23456"' "config contains normalized listen"
 assert_file_contains "$config" 'remote = "[2001:db8::1]:53"' "config contains IPv6 remote"
-assert_file_contains "$config" "$MANAGED_MARKER" "rendered config is marked managed"
+assert_file_contains "$config" "$REALM_MANAGED_MARKER" "rendered config is marked managed"
 
 release_json="$(mktemp)"
 register_temp "$release_json"
