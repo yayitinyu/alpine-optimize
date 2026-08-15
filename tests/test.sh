@@ -152,6 +152,26 @@ else
     pass "detect_target returns a linux triple ($target)"
 fi
 
+# --- sing-box asset selection (prefer musl, do not pick glibc by accident) ---
+assert_eq "sing-box-.*-linux-amd64-musl\\.tar\\.gz$" \
+    "$(singbox_asset_pattern amd64 musl)" \
+    "musl asset regex is exact"
+assert_eq "sing-box-.*-linux-amd64\\.tar\\.gz$" \
+    "$(singbox_asset_pattern amd64 glibc)" \
+    "glibc asset regex is exact"
+
+asset_json='{"assets":[
+  {"name":"sing-box-1.13.18-linux-amd64.tar.gz","browser_download_url":"https://example.invalid/glibc"},
+  {"name":"sing-box-1.13.18-linux-amd64-musl.tar.gz","browser_download_url":"https://example.invalid/musl"},
+  {"name":"sing-box-1.13.18-linux-amd64-glibc.tar.gz","browser_download_url":"https://example.invalid/named-glibc"}
+]}'
+assert_eq "https://example.invalid/musl" \
+    "$(pick_release_asset_url "$asset_json" "$(singbox_asset_pattern amd64 musl)")" \
+    "picker selects linux-amd64-musl"
+assert_eq "https://example.invalid/glibc" \
+    "$(pick_release_asset_url "$asset_json" "$(singbox_asset_pattern amd64 glibc)")" \
+    "glibc regex does not match -musl"
+
 # --- sing-box share links ---
 vless="$(vless_share_link 203.0.113.8 443 uuid-1 www.microsoft.com pubk abcd)"
 assert_file_contains <(printf '%s\n' "$vless") "vless://uuid-1@203.0.113.8:443" "vless link host/port"

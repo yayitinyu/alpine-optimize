@@ -132,9 +132,65 @@ parse_reality_keypair() {
     [[ -n "$REALITY_PRIV" && -n "$REALITY_PUB" ]]
 }
 
+host_is_musl() {
+    is_alpine && return 0
+    compgen -G '/lib/ld-musl-*.so*' >/dev/null && return 0
+    { ldd --version 2>&1 || true; } | grep -qi musl
+}
+
+singbox_asset_pattern() {
+    local goarch="$1"
+    local variant="${2:-auto}"
+    case "$variant" in
+        musl) printf 'sing-box-.*-linux-%s-musl\\.tar\\.gz$\n' "$goarch" ;;
+        glibc) printf 'sing-box-.*-linux-%s\\.tar\\.gz$\n' "$goarch" ;;
+        *) die "未知 sing-box 资产类型：${variant}" ;;
+    esac
+}
+
+pick_release_asset_url() {
+    local json="$1"
+    local pattern="$2"
+    printf '%s' "$json" | jq -r --arg p "$pattern" '
+        .assets[]? | select(.name | test($p)) | .browser_download_url
+    ' | awk 'NF && $0 != "null" { print; exit }'
+}
+
+singbox_probe() {
+    local bin="$1"
+    local output
+    [[ -x "$bin" ]] || return 1
+    output="$("$bin" version 2>&1)" || {
+        warn "二进制无法执行：${output:-not found / loader error}"
+        return 1
+    }
+    return 0
+}
+
+install_singbox_from_apk() {
+    local apk_bin=""
+    enable_community_repo
+    info "GitHub 二进制不兼容当前 musl 系统，改用 Alpine 软件包。"
+    apk_add sing-box || return 1
+    if command_exists sing-box; then
+        apk_bin="$(command -v sing-box)"
+    elif [[ -x /usr/bin/sing-box ]]; then
+        apk_bin="/usr/bin/sing-box"
+    else
+        return 1
+    fi
+    install -d -m 0755 "$(dirname "$SB_BIN")"
+    ln -sfn "$apk_bin" "$SB_BIN"
+    service_stop sing-box 2>/dev/null || true
+    service_disable sing-box 2>/dev/null || true
+    singbox_probe "$SB_BIN"
+}
+
 download_singbox() {
     local requested="${1:-latest}"
-    local goarch tmp json url tag archive extracted
+    local goarch tmp json url tag archive extracted label
+    local -a patterns=()
+
     goarch="$(detect_goarch)"
     tmp="$(new_temp_dir)"
 
@@ -155,15 +211,30 @@ download_singbox() {
 
     tag="$(printf '%s' "$json" | jq -r '.tag_name // empty')"
     [[ -n "$tag" ]] || die "发布信息中缺少版本号。"
-    url="$(printf '%s' "$json" | jq -r --arg a "$goarch" '
-        .assets[]
-        | select(.name | test("sing-box-.*-linux-" + $a + "\\.tar\\.gz$"))
-        | .browser_download_url
-    ' | head -n1)"
-    [[ -n "$url" && "$url" != "null" ]] || die "未找到 linux-${goarch} 发布包。"
+
+    if host_is_musl; then
+        patterns+=("$(singbox_asset_pattern "$goarch" musl)")
+    fi
+    patterns+=("$(singbox_asset_pattern "$goarch" glibc)")
+
+    url=""
+    label=""
+    local pattern
+    for pattern in "${patterns[@]}"; do
+        url="$(pick_release_asset_url "$json" "$pattern")"
+        if [[ -n "$url" ]]; then
+            if [[ "$pattern" == *-musl* ]]; then
+                label="linux-${goarch}-musl"
+            else
+                label="linux-${goarch}"
+            fi
+            break
+        fi
+    done
+    [[ -n "$url" ]] || die "未找到 linux-${goarch} 发布包。"
 
     archive="${tmp}/sing-box.tar.gz"
-    info "下载 sing-box ${tag}（linux-${goarch}，Go 静态二进制，可在 musl 上运行）..."
+    info "下载 sing-box ${tag}（${label}）..."
     curl -fsSL --retry 3 --connect-timeout 15 -o "$archive" "$url" || die "sing-box 下载失败。"
     tar -xzf "$archive" -C "$tmp"
     extracted="$(find "$tmp" -type f -name sing-box -print -quit)"
@@ -173,8 +244,18 @@ download_singbox() {
     if command_exists setcap; then
         setcap cap_net_bind_service=+ep "$SB_BIN" 2>/dev/null || true
     fi
-    "$SB_BIN" version >/dev/null 2>&1 || die "下载的 sing-box 无法在当前系统运行。"
-    ok "已安装 sing-box ${tag} -> ${SB_BIN}"
+
+    if singbox_probe "$SB_BIN"; then
+        ok "已安装 sing-box ${tag} -> ${SB_BIN}"
+        return 0
+    fi
+
+    if host_is_musl && install_singbox_from_apk; then
+        ok "已通过 apk 安装 sing-box -> ${SB_BIN}"
+        return 0
+    fi
+
+    die "下载的 sing-box 无法在当前系统运行。Alpine 请使用官方 linux-${goarch}-musl 包。"
 }
 
 ensure_self_signed_cert() {
