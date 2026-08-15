@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Slim sing-box installer for Alpine / OpenRC.
-# Trade-off: 4 useful inbounds instead of sing-box-plus's 20-node systemd stack.
+# Alpine sing-box: VLESS Reality + AnyTLS, optional WARP, custom routes.
+# Adapted from sing-box-plus for OpenRC / musl.
 
 if [[ -z "${ALPINE_OPTIMIZE_COMMON:-}" ]]; then
     # shellcheck disable=SC1091
     . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
 fi
 
-SB_VERSION_LABEL="1.0.0"
+SB_VERSION_LABEL="1.1.0"
 SB_GITHUB_REPO="SagerNet/sing-box"
 SB_DIR="${SB_DIR:-/opt/alpine-sing-box}"
 SB_BIN="${SB_BIN:-/usr/local/bin/sing-box}"
@@ -16,6 +16,9 @@ SB_STATE="${SB_STATE:-${SB_DIR}/state.env}"
 SB_LINKS="${SB_LINKS:-${SB_DIR}/share-links.txt}"
 SB_CERT_DIR="${SB_CERT_DIR:-${SB_DIR}/cert}"
 SB_DATA_DIR="${SB_DATA_DIR:-${SB_DIR}/data}"
+SB_ROUTE_JSON="${SB_ROUTE_JSON:-${SB_DIR}/routes.json}"
+SB_WARP_ENV="${SB_WARP_ENV:-${SB_DIR}/warp.env}"
+WGCF_BIN="${WGCF_BIN:-/usr/local/bin/wgcf}"
 SB_SERVICE="${SB_SERVICE:-alpine-sing-box}"
 SB_INIT="/etc/init.d/${SB_SERVICE}"
 SB_LOG="${SB_LOG:-/var/log/alpine-sing-box.log}"
@@ -23,12 +26,17 @@ SB_USER="${SB_USER:-sing-box}"
 MANAGED_MARKER="# Managed by alpine-optimize sing-box"
 
 SB_HOST="${SB_HOST:-}"
-SB_SNI="${SB_SNI:-www.microsoft.com}"
-SB_TLS_SNI="${SB_TLS_SNI:-www.bing.com}"
+SB_SNI="${SB_SNI:-www.tokyometro.jp}"
 SB_TAG="${SB_TAG:-latest}"
 SB_ALLOW_PRIVATE="${SB_ALLOW_PRIVATE:-0}"
 SB_LISTEN="${SB_LISTEN:-}"
+ENABLE_WARP="${ENABLE_WARP:-true}"
+WARP_KEEPALIVE_INTERVAL="${WARP_KEEPALIVE_INTERVAL:-25}"
 CLI_FORCE=0
+STATE_VERSION=""
+SBP_PARSED_HOST=""
+SBP_PARSED_PORT=""
+SBP_SELECTED_OUTBOUND=""
 
 default_listen_address() {
     if [[ -n "$SB_LISTEN" ]]; then
@@ -45,28 +53,28 @@ default_listen_address() {
 
 singbox_usage() {
     cat <<'EOF'
-Alpine sing-box 精简节点（OpenRC）
+Alpine sing-box（OpenRC）
 
-这不是 sing-box-plus 的完整移植。20 节点、WARP、ACME 和 systemd
-定时器对 Alpine 小鸡过重；这里提供 4 个常用入站：
-
-  VLESS Reality · Hysteria2 · TUIC v5 · Shadowsocks 2022
+入站：VLESS Reality + AnyTLS，各一条直连、一条 WARP。
+支持自定义分流，以及导入 socks5h / 分享链接作为远程出口。
 
 用法：
-  alpine.sh sing-box                  交互菜单
+  alpine.sh sing-box                  交互菜单（停留在子菜单）
   alpine.sh sing-box install [选项]
   alpine.sh sing-box links
   alpine.sh sing-box status
   alpine.sh sing-box restart
+  alpine.sh sing-box routes
+  alpine.sh sing-box edit
   alpine.sh sing-box update [--version TAG]
   alpine.sh sing-box uninstall [--purge] [--yes]
 
 install 选项：
   -H, --host HOST          客户端连接地址（IPv4 或域名）
-      --sni HOST           Reality 握手 / SNI，默认 www.microsoft.com
-      --tls-sni HOST       自签证书 CN，默认 www.bing.com
-      --version TAG        指定 sing-box 版本，例如 v1.12.10
+      --sni HOST           Reality / AnyTLS SNI，默认 www.tokyometro.jp
+      --version TAG        指定 sing-box 版本
       --allow-private      允许代理访问内网地址
+      --no-warp            不注册 WARP
   -f, --force              覆盖已有安装
 EOF
 }
@@ -77,6 +85,59 @@ singbox_prepare() {
     require_openrc
     enable_community_repo
     ensure_packages curl ca-certificates tar jq openssl coreutils iproute2 shadow libcap
+}
+
+urldec() {
+    local s="${1//+/ }"
+    printf '%b' "${s//%/\\x}"
+}
+
+b64dec() {
+    local s="$1" pad
+    s="${s//-/+}"; s="${s//_/\/}"
+    pad=$(( (4 - ${#s} % 4) % 4 ))
+    while ((pad > 0)); do s+="="; pad=$((pad - 1)); done
+    printf '%s' "$s" | openssl base64 -d -A 2>/dev/null || printf '%s' "$s" | base64 -d 2>/dev/null
+}
+
+query_get() {
+    local query="$1" key="$2" pair k v
+    local -a pairs
+    [[ -n "$query" ]] || return 0
+    IFS='&' read -r -a pairs <<<"$query"
+    for pair in "${pairs[@]}"; do
+        k="${pair%%=*}"
+        v="${pair#*=}"
+        [[ "$(urldec "$k")" == "$key" ]] || continue
+        urldec "$v"
+        return 0
+    done
+}
+
+split_hostport() {
+    local hostport="$1"
+    SBP_PARSED_HOST=""; SBP_PARSED_PORT=""
+    if [[ "$hostport" =~ ^\[(.*)\]:([0-9]+)$ ]]; then
+        SBP_PARSED_HOST="${BASH_REMATCH[1]}"
+        SBP_PARSED_PORT="${BASH_REMATCH[2]}"
+    elif [[ "$hostport" == *:* ]]; then
+        SBP_PARSED_HOST="${hostport%:*}"
+        SBP_PARSED_PORT="${hostport##*:}"
+    else
+        return 1
+    fi
+    [[ "$SBP_PARSED_PORT" =~ ^[0-9]+$ ]]
+}
+
+pad_b64() {
+    local s="${1:-}"
+    s="$(printf '%s' "$s" | tr -d '\r\n\" ')"
+    s="${s%%=*}"
+    local rem=$(( ${#s} % 4 ))
+    if ((rem == 2)); then s="${s}=="
+    elif ((rem == 3)); then s="${s}="
+    fi
+    printf '%s' "$s"
 }
 
 urlencode() {
@@ -93,10 +154,6 @@ urlencode() {
     printf '%s\n' "$out"
 }
 
-b64_nopad() {
-    openssl base64 -A | tr -d '='
-}
-
 generate_uuid() {
     if [[ -r /proc/sys/kernel/random/uuid ]]; then
         tr '[:upper:]' '[:lower:]' </proc/sys/kernel/random/uuid
@@ -108,13 +165,12 @@ generate_uuid() {
 choose_unique_ports() {
     local count="$1"
     local -a used=()
-    local port i j dup
+    local port i j dup existing
     for ((i = 0; i < count; i++)); do
         dup=1
         for ((j = 0; j < 64 && dup == 1; j++)); do
             port="$(choose_random_port)" || die "无法分配空闲端口。"
             dup=0
-            local existing
             for existing in "${used[@]:-}"; do
                 [[ "$existing" == "$port" ]] && dup=1
             done
@@ -188,7 +244,7 @@ install_singbox_from_apk() {
 
 download_singbox() {
     local requested="${1:-latest}"
-    local goarch tmp json url tag archive extracted label
+    local goarch tmp json url tag archive extracted label pattern
     local -a patterns=()
 
     goarch="$(detect_goarch)"
@@ -217,9 +273,7 @@ download_singbox() {
     fi
     patterns+=("$(singbox_asset_pattern "$goarch" glibc)")
 
-    url=""
-    label=""
-    local pattern
+    url=""; label=""
     for pattern in "${patterns[@]}"; do
         url="$(pick_release_asset_url "$json" "$pattern")"
         if [[ -n "$url" ]]; then
@@ -249,196 +303,478 @@ download_singbox() {
         ok "已安装 sing-box ${tag} -> ${SB_BIN}"
         return 0
     fi
-
     if host_is_musl && install_singbox_from_apk; then
         ok "已通过 apk 安装 sing-box -> ${SB_BIN}"
         return 0
     fi
-
     die "下载的 sing-box 无法在当前系统运行。Alpine 请使用官方 linux-${goarch}-musl 包。"
 }
 
+install_wgcf() {
+    [[ -x "$WGCF_BIN" ]] && singbox_probe "$WGCF_BIN" && return 0
+    local goarch url tmp json
+    goarch="$(detect_goarch)"
+    json="$(curl -fsSL --retry 3 --connect-timeout 15 \
+        -H 'Accept: application/vnd.github+json' \
+        -H 'User-Agent: alpine-optimize-sing-box' \
+        "https://api.github.com/repos/ViRb3/wgcf/releases/latest")" || return 1
+    url="$(printf '%s' "$json" | jq -r --arg a "$goarch" '
+        .assets[]? | select(.name | test("linux[_-]" + $a + "$")) | .browser_download_url
+    ' | head -n1)"
+    [[ -n "$url" && "$url" != "null" ]] || return 1
+    tmp="$(new_temp_dir)"
+    info "下载 wgcf ..."
+    curl -fsSL --retry 3 --connect-timeout 15 -o "${tmp}/wgcf" "$url" || return 1
+    chmod +x "${tmp}/wgcf"
+    if ! "${tmp}/wgcf" --help >/dev/null 2>&1; then
+        warn "wgcf 二进制无法在 musl 上运行。"
+        return 1
+    fi
+    install -m 0755 "${tmp}/wgcf" "$WGCF_BIN"
+}
+
+ensure_warp_profile() {
+    [[ "${ENABLE_WARP}" == "true" ]] || return 1
+    if [[ -f "$SB_WARP_ENV" ]]; then
+        # shellcheck disable=SC1090
+        source "$SB_WARP_ENV"
+        WARP_PRIVATE_KEY="$(pad_b64 "${WARP_PRIVATE_KEY:-}")"
+        WARP_PEER_PUBLIC_KEY="$(pad_b64 "${WARP_PEER_PUBLIC_KEY:-}")"
+        : "${WARP_RESERVED_1:=0}" "${WARP_RESERVED_2:=0}" "${WARP_RESERVED_3:=0}"
+        if [[ -n "$WARP_PRIVATE_KEY" && -n "$WARP_PEER_PUBLIC_KEY" \
+            && -n "${WARP_ENDPOINT_HOST:-}" && -n "${WARP_ENDPOINT_PORT:-}" ]]; then
+            save_warp_env
+            return 0
+        fi
+    fi
+
+    install_wgcf || { warn "wgcf 安装失败，已禁用 WARP 节点。"; ENABLE_WARP=false; return 1; }
+
+    local wd="${SB_DIR}/wgcf" prof ep host port ad rs
+    mkdir -p "$wd"
+    if [[ ! -f "$wd/wgcf-account.toml" ]]; then
+        info "正在注册 WARP 账户..."
+        if ! "$WGCF_BIN" register --accept-tos --config "$wd/wgcf-account.toml" >/dev/null; then
+            warn "WARP 注册失败，已禁用 WARP 节点。"
+            ENABLE_WARP=false
+            return 1
+        fi
+    fi
+    if ! "$WGCF_BIN" generate --config "$wd/wgcf-account.toml" --profile "$wd/wgcf-profile.conf" >/dev/null; then
+        warn "WARP 配置生成失败，已禁用 WARP 节点。"
+        ENABLE_WARP=false
+        return 1
+    fi
+
+    prof="$wd/wgcf-profile.conf"
+    WARP_PRIVATE_KEY="$(pad_b64 "$(awk -F'= *' '/^PrivateKey/{gsub(/\r/,"");print $2; exit}' "$prof")")"
+    WARP_PEER_PUBLIC_KEY="$(pad_b64 "$(awk -F'= *' '/^PublicKey/{gsub(/\r/,"");print $2; exit}' "$prof")")"
+    ep="$(awk -F'= *' '/^Endpoint/{gsub(/\r/,"");print $2; exit}' "$prof" | tr -d '" ')"
+    if [[ "$ep" =~ ^\[(.+)\]:(.+)$ ]]; then
+        host="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
+    else
+        host="${ep%:*}"; port="${ep##*:}"
+    fi
+    WARP_ENDPOINT_HOST="$host"
+    WARP_ENDPOINT_PORT="$port"
+    ad="$(awk -F'= *' '/^Address/{gsub(/\r/,"");print $2; exit}' "$prof" | tr -d '" ')"
+    WARP_ADDRESS_V4="${ad%%,*}"
+    WARP_ADDRESS_V6="${ad##*,}"
+    [[ "$WARP_ADDRESS_V4" == "$WARP_ADDRESS_V6" ]] && WARP_ADDRESS_V6=""
+    rs="$(awk -F'= *' '/^Reserved/{gsub(/\r/,"");print $2; exit}' "$prof" | tr -d '" ')"
+    WARP_RESERVED_1="${rs%%,*}"; rs="${rs#*,}"
+    WARP_RESERVED_2="${rs%%,*}"; WARP_RESERVED_3="${rs##*,}"
+    : "${WARP_RESERVED_1:=0}" "${WARP_RESERVED_2:=0}" "${WARP_RESERVED_3:=0}"
+    if [[ -z "$WARP_PRIVATE_KEY" || -z "$WARP_PEER_PUBLIC_KEY" || -z "$WARP_ENDPOINT_HOST" ]]; then
+        warn "WARP 配置不完整，已禁用 WARP 节点。"
+        ENABLE_WARP=false
+        return 1
+    fi
+    save_warp_env
+    ok "WARP 配置已就绪。"
+}
+
+save_warp_env() {
+    write_file "$SB_WARP_ENV" 0600 <<EOF
+WARP_PRIVATE_KEY=$(printf '%q' "${WARP_PRIVATE_KEY:-}")
+WARP_PEER_PUBLIC_KEY=$(printf '%q' "${WARP_PEER_PUBLIC_KEY:-}")
+WARP_ENDPOINT_HOST=$(printf '%q' "${WARP_ENDPOINT_HOST:-}")
+WARP_ENDPOINT_PORT=$(printf '%q' "${WARP_ENDPOINT_PORT:-}")
+WARP_ADDRESS_V4=$(printf '%q' "${WARP_ADDRESS_V4:-}")
+WARP_ADDRESS_V6=$(printf '%q' "${WARP_ADDRESS_V6:-}")
+WARP_RESERVED_1=$(printf '%q' "${WARP_RESERVED_1:-0}")
+WARP_RESERVED_2=$(printf '%q' "${WARP_RESERVED_2:-0}")
+WARP_RESERVED_3=$(printf '%q' "${WARP_RESERVED_3:-0}")
+EOF
+}
+
+warp_ready() {
+    [[ "${ENABLE_WARP}" == "true" \
+        && -n "${WARP_PRIVATE_KEY:-}" \
+        && -n "${WARP_PEER_PUBLIC_KEY:-}" \
+        && -n "${WARP_ENDPOINT_HOST:-}" \
+        && -n "${WARP_ENDPOINT_PORT:-}" ]]
+}
+
+empty_route_json() { printf '%s\n' '{"rules":[],"rule_set":[],"outbounds":[]}'; }
+
+ensure_route_file() {
+    mkdir -p "$SB_DIR"
+    if [[ ! -s "$SB_ROUTE_JSON" ]]; then
+        empty_route_json >"$SB_ROUTE_JSON"
+        return 0
+    fi
+    if ! jq -e 'type == "object"' "$SB_ROUTE_JSON" >/dev/null 2>&1; then
+        mv "$SB_ROUTE_JSON" "${SB_ROUTE_JSON}.bad.$(date +%Y%m%d-%H%M%S)"
+        warn "自定义路由文件无效，已重建。"
+        empty_route_json >"$SB_ROUTE_JSON"
+    fi
+}
+
+load_route_json() {
+    ensure_route_file
+    jq -c '.rules = (.rules // []) | .rule_set = (.rule_set // []) | .outbounds = (.outbounds // [])' "$SB_ROUTE_JSON"
+}
+
+valid_route_tag() { [[ "${1:-}" =~ ^[A-Za-z0-9._@!-]+$ ]]; }
+
+default_ipv4_address() {
+    ip -4 route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
+}
+
+default_ipv6_address() {
+    ip -6 route get 2606:4700:4700::1111 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}'
+}
+
+parse_route_match_json() {
+    local raw="$1" token key value code tag url json
+    json='{"domain":[],"domain_suffix":[],"domain_keyword":[],"domain_regex":[],"rule_set":[],"rule_set_defs":[]}'
+    raw="${raw//$'\r'/ }"
+    raw="${raw//$'\n'/ }"
+    raw="${raw//,/ }"
+    local -a tokens=()
+    local oldifs=$IFS
+    IFS=$' \t'
+    read -r -a tokens <<<"$raw"
+    IFS=$oldifs
+    for token in "${tokens[@]}"; do
+        [[ -n "$token" ]] || continue
+        value="$token"
+        case "$token" in
+            geosite:*|site:*) key="geosite"; value="${token#*:}" ;;
+            domain:*) key="domain"; value="${token#*:}" ;;
+            suffix:*) key="suffix"; value="${token#*:}" ;;
+            keyword:*) key="keyword"; value="${token#*:}" ;;
+            regex:*) key="regex"; value="${token#*:}" ;;
+            *.*) key="suffix" ;;
+            *) key="geosite" ;;
+        esac
+        [[ -n "$value" ]] || continue
+        case "$key" in
+            geosite)
+                code="$value"
+                valid_route_tag "$code" || continue
+                tag="geosite-${code}"
+                url="https://raw.githubusercontent.com/SagerNet/sing-geosite/rule-set/${tag}.srs"
+                json="$(printf '%s' "$json" | jq -c --arg tag "$tag" --arg url "$url" '
+                    .rule_set += [$tag]
+                    | .rule_set = (.rule_set | unique)
+                    | .rule_set_defs += [{type:"remote", tag:$tag, format:"binary", url:$url, download_detour:"direct", update_interval:"1d"}]
+                    | .rule_set_defs = (.rule_set_defs | unique_by(.tag))')"
+                ;;
+            domain)
+                json="$(printf '%s' "$json" | jq -c --arg v "$value" '.domain += [$v] | .domain = (.domain | unique)')" ;;
+            suffix)
+                json="$(printf '%s' "$json" | jq -c --arg v "$value" '.domain_suffix += [$v] | .domain_suffix = (.domain_suffix | unique)')" ;;
+            keyword)
+                json="$(printf '%s' "$json" | jq -c --arg v "$value" '.domain_keyword += [$v] | .domain_keyword = (.domain_keyword | unique)')" ;;
+            regex)
+                json="$(printf '%s' "$json" | jq -c --arg v "$value" '.domain_regex += [$v] | .domain_regex = (.domain_regex | unique)')" ;;
+        esac
+    done
+    printf '%s' "$json" | jq -c 'with_entries(select((.key == "rule_set_defs") or ((.value | type) != "array") or ((.value | length) > 0)))'
+}
+
+share_link_to_outbound() {
+    local link="$1" tag="$2" scheme rest body query userinfo hostport server port
+    local sni fp insecure allow username password ver
+    link="${link//$'\r'/}"
+    link="${link//$'\n'/}"
+    scheme="${link%%://*}"
+    [[ "$scheme" != "$link" ]] || return 1
+    rest="${link#*://}"
+    body="${rest%%\#*}"
+    query=""
+    if [[ "$body" == *"?"* ]]; then
+        query="${body#*\?}"
+        body="${body%%\?*}"
+    fi
+
+    case "$scheme" in
+        vless|anytls|socks|socks5|socks5h|socks4|socks4a|http|https)
+            ;;
+        *) return 1 ;;
+    esac
+
+    case "$scheme" in
+        vless)
+            [[ "$body" == *"@"* ]] || return 1
+            userinfo="${body%@*}"; hostport="${body##*@}"
+            split_hostport "$hostport" || return 1
+            server="$SBP_PARSED_HOST"; port="$SBP_PARSED_PORT"
+            local uuid flow security pbk sid
+            uuid="$(urldec "$userinfo")"
+            flow="$(query_get "$query" flow)"
+            security="$(query_get "$query" security)"
+            sni="$(query_get "$query" sni)"
+            fp="$(query_get "$query" fp)"
+            pbk="$(query_get "$query" pbk)"
+            sid="$(query_get "$query" sid)"
+            jq -n -c \
+                --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg uuid "$uuid" \
+                --arg flow "$flow" --arg security "$security" --arg sni "$sni" --arg fp "${fp:-chrome}" \
+                --arg pbk "$pbk" --arg sid "$sid" '
+                {type:"vless", tag:$tag, server:$server, server_port:$port, uuid:$uuid, domain_resolver:"dns-doh-primary"}
+                | if $flow != "" then .flow = $flow else . end
+                | if $security == "reality" then
+                    .tls = {enabled:true, server_name:$sni, utls:{enabled:true, fingerprint:$fp}, reality:{enabled:true, public_key:$pbk, short_id:$sid}}
+                  elif $security == "tls" then
+                    .tls = ({enabled:true} | if $sni != "" then .server_name = $sni else . end)
+                  else . end'
+            ;;
+        anytls)
+            [[ "$body" == *"@"* ]] || return 1
+            userinfo="${body%@*}"; hostport="${body##*@}"
+            split_hostport "$hostport" || return 1
+            server="$SBP_PARSED_HOST"; port="$SBP_PARSED_PORT"
+            password="$(urldec "$userinfo")"
+            sni="$(query_get "$query" sni)"
+            insecure="$(query_get "$query" insecure)"
+            allow="$(query_get "$query" allowInsecure)"
+            [[ "$insecure" == "1" || "$allow" == "1" ]] && insecure=true || insecure=false
+            jq -n -c \
+                --arg tag "$tag" --arg server "$server" --argjson port "$port" \
+                --arg password "$password" --arg sni "$sni" --argjson insecure "$insecure" '
+                {type:"anytls", tag:$tag, server:$server, server_port:$port, password:$password,
+                 tls:({enabled:true, alpn:["h2","http/1.1"]}
+                    | if $sni != "" then .server_name = $sni else . end
+                    | if $insecure then .insecure = true else . end),
+                 domain_resolver:"dns-doh-primary"}'
+            ;;
+        socks|socks5|socks5h|socks4|socks4a)
+            ver="5"
+            [[ "$scheme" == "socks4" || "$scheme" == "socks4a" ]] && ver="4"
+            username=""; password=""
+            if [[ "$body" == *"@"* ]]; then
+                userinfo="${body%@*}"; hostport="${body##*@}"
+                if [[ "$userinfo" == *:* ]]; then
+                    username="$(urldec "${userinfo%%:*}")"
+                    password="$(urldec "${userinfo#*:}")"
+                else
+                    username="$(urldec "$userinfo")"
+                fi
+            else
+                hostport="$body"
+            fi
+            split_hostport "$hostport" || return 1
+            server="$SBP_PARSED_HOST"; port="$SBP_PARSED_PORT"
+            jq -n -c \
+                --arg tag "$tag" --arg server "$server" --argjson port "$port" \
+                --arg user "$username" --arg pass "$password" --arg ver "$ver" '
+                {type:"socks", tag:$tag, server:$server, server_port:$port, version:$ver, domain_resolver:"dns-doh-primary"}
+                | if $user != "" then .username = $user else . end
+                | if $pass != "" then .password = $pass else . end'
+            ;;
+        http|https)
+            username=""; password=""
+            if [[ "$body" == *"@"* ]]; then
+                userinfo="${body%@*}"; hostport="${body##*@}"
+                if [[ "$userinfo" == *:* ]]; then
+                    username="$(urldec "${userinfo%%:*}")"
+                    password="$(urldec "${userinfo#*:}")"
+                else
+                    username="$(urldec "$userinfo")"
+                fi
+            else
+                hostport="$body"
+            fi
+            split_hostport "$hostport" || return 1
+            server="$SBP_PARSED_HOST"; port="$SBP_PARSED_PORT"
+            jq -n -c \
+                --arg tag "$tag" --arg server "$server" --argjson port "$port" \
+                --arg user "$username" --arg pass "$password" --argjson https "$([[ "$scheme" == "https" ]] && echo true || echo false)" '
+                {type:"http", tag:$tag, server:$server, server_port:$port, domain_resolver:"dns-doh-primary"}
+                | if $user != "" then .username = $user else . end
+                | if $pass != "" then .password = $pass else . end
+                | if $https then .tls = {enabled:true} else . end'
+            ;;
+        *) return 1 ;;
+    esac
+}
+
 ensure_self_signed_cert() {
+    local force="${1:-0}"
     mkdir -p "$SB_CERT_DIR"
     local key="${SB_CERT_DIR}/key.pem"
     local crt="${SB_CERT_DIR}/cert.pem"
-    if [[ -f "$key" && -f "$crt" ]]; then
+    local cn=""
+    if [[ -f "$crt" ]]; then
+        cn="$(openssl x509 -noout -subject -in "$crt" 2>/dev/null | sed -n 's/.*CN[[:space:]]*=[[:space:]]*//p')"
+    fi
+    if [[ "$force" != "1" && -f "$key" && -f "$crt" && "$cn" == "$SB_SNI" ]]; then
         return 0
     fi
     openssl ecparam -genkey -name prime256v1 -out "$key" >/dev/null 2>&1
     openssl req -new -x509 -days 3650 -key "$key" -out "$crt" \
-        -subj "/CN=${SB_TLS_SNI}" >/dev/null 2>&1 \
+        -subj "/CN=${SB_SNI}" >/dev/null 2>&1 \
         || die "生成自签证书失败。"
     chmod 600 "$key"
     chmod 644 "$crt"
 }
 
 render_singbox_config() {
-    local private_rule=""
-    local listen
+    local listen routes
     listen="$(default_listen_address)"
-    if ((SB_ALLOW_PRIVATE == 0)); then
-        private_rule=',
-      {
-        "ip_is_private": true,
-        "action": "reject"
-      }'
-    fi
+    routes="$(load_route_json)"
+    local warp="false"
+    warp_ready && warp="true"
 
-    cat <<EOF
-{
-  "log": {
-    "level": "warn",
-    "timestamp": true,
-    "output": "${SB_LOG}"
-  },
-  "inbounds": [
-    {
-      "type": "vless",
-      "tag": "vless-reality",
-      "listen": "${listen}",
-      "listen_port": ${PORT_VLESS},
-      "users": [
+    jq -n \
+        --arg LOG "$SB_LOG" --arg LISTEN "$listen" --arg SNI "$SB_SNI" \
+        --arg CRT "${SB_CERT_DIR}/cert.pem" --arg KEY "${SB_CERT_DIR}/key.pem" \
+        --arg UUID "$UUID" --arg RPRIV "$REALITY_PRIV" --arg RSID "$REALITY_SID" \
+        --arg ANYTLS "$ANYTLS_PWD" \
+        --argjson PV "${PORT_VLESS:-0}" --argjson PA "${PORT_ANYTLS:-0}" \
+        --argjson PVW "${PORT_VLESS_W:-0}" --argjson PAW "${PORT_ANYTLS_W:-0}" \
+        --argjson WARP "$warp" --argjson PRIV "$SB_ALLOW_PRIVATE" \
+        --arg WPRIV "${WARP_PRIVATE_KEY:-}" --arg WPPUB "${WARP_PEER_PUBLIC_KEY:-}" \
+        --arg WHOST "${WARP_ENDPOINT_HOST:-}" --argjson WPORT "${WARP_ENDPOINT_PORT:-0}" \
+        --arg W4 "${WARP_ADDRESS_V4:-}" --arg W6 "${WARP_ADDRESS_V6:-}" \
+        --argjson WR1 "${WARP_RESERVED_1:-0}" --argjson WR2 "${WARP_RESERVED_2:-0}" --argjson WR3 "${WARP_RESERVED_3:-0}" \
+        --argjson WKA "${WARP_KEEPALIVE_INTERVAL:-25}" \
+        --argjson CUSTOM "$routes" \
+        --arg BIND4 "$(default_ipv4_address || true)" --arg BIND6 "$(default_ipv6_address || true)" '
+        def inbound_vless($port; $tag):
+          {type:"vless", tag:$tag, listen:$LISTEN, listen_port:$port,
+           users:[{uuid:$UUID, flow:"xtls-rprx-vision"}],
+           tls:{enabled:true, server_name:$SNI,
+                reality:{enabled:true, handshake:{server:$SNI, server_port:443},
+                         private_key:$RPRIV, short_id:[$RSID]}}};
+        def inbound_anytls($port; $tag):
+          {type:"anytls", tag:$tag, listen:$LISTEN, listen_port:$port,
+           users:[{name:"anytls", password:$ANYTLS}],
+           tls:{enabled:true, server_name:$SNI, alpn:["h2","http/1.1"],
+                certificate_path:$CRT, key_path:$KEY}};
+        def custom_rule($rule):
+          ({}
+            + (if (($rule.domain // [])|length)>0 then {domain:$rule.domain} else {} end)
+            + (if (($rule.domain_suffix // [])|length)>0 then {domain_suffix:$rule.domain_suffix} else {} end)
+            + (if (($rule.domain_keyword // [])|length)>0 then {domain_keyword:$rule.domain_keyword} else {} end)
+            + (if (($rule.domain_regex // [])|length)>0 then {domain_regex:$rule.domain_regex} else {} end)
+            + (if (($rule.rule_set // [])|length)>0 then {rule_set:$rule.rule_set} else {} end)
+            + {action:"route", outbound:$rule.outbound});
+        def uses($tag):
+          ((($CUSTOM.rules // []) | map(select((.outbound // "") == $tag)) | length) > 0);
         {
-          "uuid": "${UUID}",
-          "flow": "xtls-rprx-vision"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "${SB_SNI}",
-        "reality": {
-          "enabled": true,
-          "handshake": {
-            "server": "${SB_SNI}",
-            "server_port": 443
+          log:{level:"warn", timestamp:true, output:$LOG},
+          dns:{
+            servers:[
+              {type:"https", tag:"dns-doh-primary", server:"1.1.1.1", path:"/dns-query",
+               tls:{enabled:true, server_name:"cloudflare-dns.com"}},
+              {type:"udp", tag:"dns-udp-fallback", server:"1.0.0.1"}
+            ],
+            final:"dns-doh-primary",
+            strategy:"prefer_ipv4"
           },
-          "private_key": "${REALITY_PRIV}",
-          "short_id": ["${REALITY_SID}"]
-        }
-      }
-    },
-    {
-      "type": "hysteria2",
-      "tag": "hysteria2",
-      "listen": "${listen}",
-      "listen_port": ${PORT_HY2},
-      "users": [
-        {
-          "password": "${HY2_PWD}"
-        }
-      ],
-      "tls": {
-        "enabled": true,
-        "server_name": "${SB_TLS_SNI}",
-        "certificate_path": "${SB_CERT_DIR}/cert.pem",
-        "key_path": "${SB_CERT_DIR}/key.pem"
-      }
-    },
-    {
-      "type": "tuic",
-      "tag": "tuic",
-      "listen": "${listen}",
-      "listen_port": ${PORT_TUIC},
-      "users": [
-        {
-          "uuid": "${TUIC_UUID}",
-          "password": "${TUIC_PWD}"
-        }
-      ],
-      "congestion_control": "bbr",
-      "tls": {
-        "enabled": true,
-        "server_name": "${SB_TLS_SNI}",
-        "alpn": ["h3"],
-        "certificate_path": "${SB_CERT_DIR}/cert.pem",
-        "key_path": "${SB_CERT_DIR}/key.pem"
-      }
-    },
-    {
-      "type": "shadowsocks",
-      "tag": "ss2022",
-      "listen": "${listen}",
-      "listen_port": ${PORT_SS},
-      "method": "2022-blake3-aes-128-gcm",
-      "password": "${SS_KEY}"
-    }
-  ],
-  "outbounds": [
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ],
-  "route": {
-    "rules": [
-      {
-        "action": "sniff"
-      }${private_rule}
-    ],
-    "final": "direct"
-  }
-}
-EOF
+          endpoints: (if $WARP then [{
+            type:"wireguard", tag:"warp", system:false,
+            address: ([ $W4, $W6 ] | map(select(. != ""))),
+            private_key:$WPRIV,
+            peers:[{address:$WHOST, port:$WPORT, public_key:$WPPUB,
+                    reserved:[$WR1,$WR2,$WR3],
+                    allowed_ips:["0.0.0.0/0","::/0"],
+                    persistent_keepalive_interval:$WKA}],
+            mtu:1280,
+            domain_resolver:"dns-doh-primary"
+          }] else [] end),
+          inbounds: (
+            [inbound_vless($PV; "vless-reality"), inbound_anytls($PA; "anytls")]
+            + (if $WARP then [inbound_vless($PVW; "vless-reality-warp"), inbound_anytls($PAW; "anytls-warp")] else [] end)
+          ),
+          outbounds: (
+            [{type:"direct", tag:"direct", domain_resolver:"dns-doh-primary"}]
+            + (if uses("direct-ipv4") then
+                [{type:"direct", tag:"direct-ipv4",
+                  domain_resolver:{server:"dns-doh-primary", strategy:"ipv4_only"}}
+                 + (if $BIND4 != "" then {inet4_bind_address:$BIND4, bind_address_no_port:true} else {} end)]
+              else [] end)
+            + (if uses("direct-ipv6") then
+                [{type:"direct", tag:"direct-ipv6",
+                  domain_resolver:{server:"dns-doh-primary", strategy:"ipv6_only"}}
+                 + (if $BIND6 != "" then {inet6_bind_address:$BIND6, bind_address_no_port:true} else {} end)]
+              else [] end)
+            + (($CUSTOM.outbounds // []) | map(select((.tag // "") != "" and (.type // "") != "")))
+          ),
+          route: (
+            {
+              default_domain_resolver:"dns-doh-primary",
+              final:"direct",
+              rules: (
+                [{action:"sniff"}]
+                + (($CUSTOM.rules // []) | map(select((.outbound // "") != "")) | map(custom_rule(.)))
+                + (if $WARP then [{inbound:["vless-reality-warp","anytls-warp"], action:"route", outbound:"warp"}] else [] end)
+                + (if $PRIV == 0 then [{ip_is_private:true, action:"reject"}] else [] end)
+              )
+            }
+            + (if (($CUSTOM.rule_set // [])|length) > 0 then {rule_set:($CUSTOM.rule_set)} else {} end)
+          )
+        }'
 }
 
-# Testable share-link builders.
 vless_share_link() {
     local host="$1" port="$2" uuid="$3" sni="$4" pbk="$5" sid="$6" name="${7:-vless-reality}"
     printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s\n' \
         "$uuid" "$host" "$port" "$(urlencode "$sni")" "$pbk" "$sid" "$(urlencode "$name")"
 }
 
-hy2_share_link() {
-    local host="$1" port="$2" password="$3" sni="$4" name="${5:-hysteria2}"
-    printf 'hysteria2://%s@%s:%s?insecure=1&sni=%s#%s\n' \
+anytls_share_link() {
+    local host="$1" port="$2" password="$3" sni="$4" name="${5:-anytls}"
+    printf 'anytls://%s@%s:%s?insecure=1&sni=%s&alpn=h2,http/1.1&fp=chrome#%s\n' \
         "$(urlencode "$password")" "$host" "$port" "$(urlencode "$sni")" "$(urlencode "$name")"
-}
-
-tuic_share_link() {
-    local host="$1" port="$2" uuid="$3" password="$4" sni="$5" name="${6:-tuic}"
-    printf 'tuic://%s:%s@%s:%s?congestion_control=bbr&udp_relay_mode=native&alpn=h3&allow_insecure=1&sni=%s#%s\n' \
-        "$uuid" "$(urlencode "$password")" "$host" "$port" "$(urlencode "$sni")" "$(urlencode "$name")"
-}
-
-ss2022_share_link() {
-    local host="$1" port="$2" key="$3" name="${4:-ss2022}"
-    local userinfo
-    userinfo="$(printf '%s' "2022-blake3-aes-128-gcm:${key}" | b64_nopad)"
-    printf 'ss://%s@%s:%s#%s\n' "$userinfo" "$host" "$port" "$(urlencode "$name")"
 }
 
 write_share_links() {
     local host="${SB_HOST}"
     [[ -n "$host" ]] || host="$(discover_public_ipv4)"
     {
-        vless_share_link "$host" "$PORT_VLESS" "$UUID" "$SB_SNI" "$REALITY_PUB" "$REALITY_SID"
-        hy2_share_link "$host" "$PORT_HY2" "$HY2_PWD" "$SB_TLS_SNI"
-        tuic_share_link "$host" "$PORT_TUIC" "$TUIC_UUID" "$TUIC_PWD" "$SB_TLS_SNI"
-        ss2022_share_link "$host" "$PORT_SS" "$SS_KEY"
+        echo "# 直连"
+        vless_share_link "$host" "$PORT_VLESS" "$UUID" "$SB_SNI" "$REALITY_PUB" "$REALITY_SID" "vless-reality"
+        anytls_share_link "$host" "$PORT_ANYTLS" "$ANYTLS_PWD" "$SB_SNI" "anytls"
+        if warp_ready; then
+            echo "# WARP"
+            vless_share_link "$host" "$PORT_VLESS_W" "$UUID" "$SB_SNI" "$REALITY_PUB" "$REALITY_SID" "vless-reality-warp"
+            anytls_share_link "$host" "$PORT_ANYTLS_W" "$ANYTLS_PWD" "$SB_SNI" "anytls-warp"
+        fi
     } >"$SB_LINKS"
     chmod 600 "$SB_LINKS"
 }
 
 write_sb_state() {
     write_file "$SB_STATE" 0600 <<EOF
-STATE_VERSION=1
+STATE_VERSION=2
 SB_HOST=$(printf '%q' "$SB_HOST")
 SB_SNI=$(printf '%q' "$SB_SNI")
-SB_TLS_SNI=$(printf '%q' "$SB_TLS_SNI")
 UUID=$(printf '%q' "$UUID")
 REALITY_PRIV=$(printf '%q' "$REALITY_PRIV")
 REALITY_PUB=$(printf '%q' "$REALITY_PUB")
 REALITY_SID=$(printf '%q' "$REALITY_SID")
-HY2_PWD=$(printf '%q' "$HY2_PWD")
-TUIC_UUID=$(printf '%q' "$TUIC_UUID")
-TUIC_PWD=$(printf '%q' "$TUIC_PWD")
-SS_KEY=$(printf '%q' "$SS_KEY")
+ANYTLS_PWD=$(printf '%q' "$ANYTLS_PWD")
 PORT_VLESS=$(printf '%q' "$PORT_VLESS")
-PORT_HY2=$(printf '%q' "$PORT_HY2")
-PORT_TUIC=$(printf '%q' "$PORT_TUIC")
-PORT_SS=$(printf '%q' "$PORT_SS")
+PORT_ANYTLS=$(printf '%q' "$PORT_ANYTLS")
+PORT_VLESS_W=$(printf '%q' "${PORT_VLESS_W:-}")
+PORT_ANYTLS_W=$(printf '%q' "${PORT_ANYTLS_W:-}")
 SB_ALLOW_PRIVATE=$(printf '%q' "$SB_ALLOW_PRIVATE")
+ENABLE_WARP=$(printf '%q' "$ENABLE_WARP")
 INSTALLED_AT=$(printf '%q' "$(iso_now)")
 EOF
 }
@@ -447,6 +783,25 @@ load_sb_state() {
     [[ -f "$SB_STATE" ]] || die "没有找到安装状态：${SB_STATE}"
     # shellcheck disable=SC1090
     source "$SB_STATE"
+    [[ -f "$SB_WARP_ENV" ]] && { # shellcheck disable=SC1090
+        source "$SB_WARP_ENV"
+    }
+    migrate_legacy_state
+}
+
+migrate_legacy_state() {
+    [[ "${STATE_VERSION:-1}" == "2" && -n "${ANYTLS_PWD:-}" && -n "${PORT_ANYTLS:-}" ]] && return 0
+    info "检测到旧版 4 协议节点，正在迁移为 VLESS + AnyTLS。"
+    [[ -n "${PORT_VLESS:-}" ]] || PORT_VLESS="$(choose_random_port)"
+    [[ -n "${PORT_ANYTLS:-}" ]] || PORT_ANYTLS="$(choose_random_port)"
+    [[ -n "${PORT_VLESS_W:-}" ]] || PORT_VLESS_W="$(choose_random_port)"
+    [[ -n "${PORT_ANYTLS_W:-}" ]] || PORT_ANYTLS_W="$(choose_random_port)"
+    [[ -n "${ANYTLS_PWD:-}" ]] || ANYTLS_PWD="$(random_hex 16)"
+    if [[ -z "${SB_SNI:-}" || "$SB_SNI" == "www.microsoft.com" || "${SB_TLS_SNI:-}" == "www.bing.com" ]]; then
+        SB_SNI="www.tokyometro.jp"
+    fi
+    ENABLE_WARP="${ENABLE_WARP:-true}"
+    STATE_VERSION=2
 }
 
 write_sb_init() {
@@ -477,6 +832,42 @@ start_pre() {
 EOF
 }
 
+apply_singbox_config() {
+    local tmp_conf conf_bak
+    ensure_self_signed_cert
+    ensure_route_file
+    tmp_conf="$(mktemp "${SB_DIR}/config.json.tmp.XXXXXX")"
+    register_temp "$tmp_conf"
+    render_singbox_config >"$tmp_conf" || { rm -f "$tmp_conf"; return 1; }
+    "$SB_BIN" check -c "$tmp_conf" || {
+        warn "sing-box 配置校验失败。"
+        rm -f "$tmp_conf"
+        return 1
+    }
+    conf_bak=""
+    if [[ -f "$SB_CONF" ]]; then
+        conf_bak="$(mktemp)"
+        cp -a "$SB_CONF" "$conf_bak"
+    fi
+    install -m 0640 "$tmp_conf" "$SB_CONF"
+    chown "${SB_USER}:${SB_USER}" "$SB_CONF" "$SB_DIR" "$SB_DATA_DIR" "$SB_CERT_DIR" \
+        "${SB_CERT_DIR}/key.pem" "${SB_CERT_DIR}/cert.pem" 2>/dev/null || true
+    write_sb_state
+    write_share_links
+    write_sb_init
+    if [[ -x "$SB_INIT" ]]; then
+        service_enable "$SB_SERVICE"
+        if ! service_restart "$SB_SERVICE"; then
+            [[ -n "$conf_bak" ]] && cp -a "$conf_bak" "$SB_CONF"
+            rm -f "$conf_bak"
+            tail -n 40 "$SB_LOG" >&2 || true
+            return 1
+        fi
+    fi
+    rm -f "$conf_bak"
+    return 0
+}
+
 print_links() {
     [[ -f "$SB_LINKS" ]] || die "尚未安装，或分享链接不存在。"
     echo
@@ -484,8 +875,13 @@ print_links() {
     cat "$SB_LINKS"
     echo
     info "完整副本：${SB_LINKS}"
-    warn "Hysteria2 / TUIC 使用自签证书，客户端需允许 insecure。"
-    warn "云安全组需放行以上 4 个端口（VLESS=TCP，其余含 UDP）。"
+    warn "AnyTLS 使用自签证书，客户端需允许 insecure。"
+    warn "云安全组请放行对应 TCP 端口（含 WARP 节点时共 4 个）。"
+}
+
+require_installed() {
+    [[ -f "$SB_STATE" && -x "$SB_BIN" ]] || die "尚未安装，请先选择安装。"
+    load_sb_state
 }
 
 singbox_install() {
@@ -494,9 +890,10 @@ singbox_install() {
         case "$1" in
             -H|--host) (($# >= 2)) || die "--host 缺少参数"; SB_HOST="$2"; shift 2 ;;
             --sni) (($# >= 2)) || die "--sni 缺少参数"; SB_SNI="$2"; shift 2 ;;
-            --tls-sni) (($# >= 2)) || die "--tls-sni 缺少参数"; SB_TLS_SNI="$2"; shift 2 ;;
+            --tls-sni) (($# >= 2)) || die "--tls-sni 缺少参数"; SB_SNI="$2"; shift 2 ;;
             --version) (($# >= 2)) || die "--version 缺少参数"; SB_TAG="$2"; shift 2 ;;
             --allow-private) SB_ALLOW_PRIVATE=1; shift ;;
+            --no-warp) ENABLE_WARP=false; shift ;;
             -f|--force) CLI_FORCE=1; shift ;;
             -h|--help) singbox_usage; return 0 ;;
             *) die "未知 install 参数：$1" ;;
@@ -507,58 +904,49 @@ singbox_install() {
         is_valid_host "$SB_HOST" || die "入口地址无效：${SB_HOST}"
     fi
     is_valid_host "$SB_SNI" || die "SNI 无效：${SB_SNI}"
-    is_valid_host "$SB_TLS_SNI" || die "TLS SNI 无效：${SB_TLS_SNI}"
 
     singbox_prepare
     if [[ -f "$SB_STATE" && "$CLI_FORCE" -ne 1 ]]; then
-        info "检测到已有安装，显示现有链接。覆盖请加 --force。"
         load_sb_state
+        if [[ "${STATE_VERSION:-1}" != "2" || -z "${ANYTLS_PWD:-}" ]]; then
+            info "正在按新方案重建配置（保留 VLESS 凭证）..."
+            ensure_system_user "$SB_USER"
+            ensure_warp_profile || true
+            apply_singbox_config || die "迁移后启动失败。"
+            ok "已迁移到 VLESS + AnyTLS。"
+            print_links
+            return 0
+        fi
+        info "检测到已有安装，显示现有链接。覆盖请加 --force。"
         print_links
         return 0
     fi
 
     mkdir -p "$SB_DIR" "$SB_DATA_DIR" "$SB_CERT_DIR"
     ensure_system_user "$SB_USER"
+    ensure_route_file
     download_singbox "$SB_TAG"
-    ensure_self_signed_cert
+    ensure_warp_profile || true
 
     ports="$(choose_unique_ports 4)"
     # shellcheck disable=SC2206
     local -a port_arr=($ports)
     PORT_VLESS="${port_arr[0]}"
-    PORT_HY2="${port_arr[1]}"
-    PORT_TUIC="${port_arr[2]}"
-    PORT_SS="${port_arr[3]}"
+    PORT_ANYTLS="${port_arr[1]}"
+    PORT_VLESS_W="${port_arr[2]}"
+    PORT_ANYTLS_W="${port_arr[3]}"
 
     UUID="$(generate_uuid)"
-    TUIC_UUID="$(generate_uuid)"
-    HY2_PWD="$(random_hex 16)"
-    TUIC_PWD="$(random_hex 16)"
-    SS_KEY="$("$SB_BIN" generate rand --base64 16 2>/dev/null || openssl rand -base64 16)"
+    ANYTLS_PWD="$(random_hex 16)"
     REALITY_SID="$(random_hex 8)"
     local kp
     kp="$("$SB_BIN" generate reality-keypair)" || die "无法生成 Reality 密钥对。"
     parse_reality_keypair "$kp" || die "无法解析 Reality 密钥对。"
+    STATE_VERSION=2
 
-    local tmp_conf
-    tmp_conf="$(mktemp "${SB_DIR}/config.json.tmp.XXXXXX")"
-    register_temp "$tmp_conf"
-    render_singbox_config >"$tmp_conf"
-    "$SB_BIN" check -c "$tmp_conf" || die "生成的 sing-box 配置校验失败。"
-    install -m 0640 "$tmp_conf" "$SB_CONF"
-    chown "${SB_USER}:${SB_USER}" "$SB_CONF" "$SB_DIR" "$SB_DATA_DIR" "$SB_CERT_DIR" \
-        "${SB_CERT_DIR}/key.pem" "${SB_CERT_DIR}/cert.pem" 2>/dev/null || true
-
-    write_sb_state
-    write_share_links
-    write_sb_init
     touch "$SB_LOG"
     chown "${SB_USER}:${SB_USER}" "$SB_LOG" 2>/dev/null || true
-    service_enable "$SB_SERVICE"
-    service_restart "$SB_SERVICE" || {
-        tail -n 40 "$SB_LOG" >&2 || true
-        die "sing-box 启动失败。"
-    }
+    apply_singbox_config || die "sing-box 启动失败。"
     service_is_active "$SB_SERVICE" || die "sing-box 未能保持运行。"
     ok "sing-box 已安装并开机自启。"
     print_links
@@ -574,10 +962,9 @@ singbox_update() {
         esac
     done
     singbox_prepare
-    [[ -f "$SB_STATE" ]] || die "尚未安装。"
+    require_installed
     download_singbox "$version"
-    "$SB_BIN" check -c "$SB_CONF" || die "现有配置与新版本不兼容。"
-    service_restart "$SB_SERVICE" || die "更新后启动失败。"
+    apply_singbox_config || die "更新后启动失败。"
     ok "sing-box 已更新。"
     "$SB_BIN" version || true
 }
@@ -594,10 +981,16 @@ singbox_status() {
     fi
     if [[ -f "$SB_STATE" ]]; then
         load_sb_state
-        echo "VLESS:  ${PORT_VLESS}"
-        echo "HY2:    ${PORT_HY2}"
-        echo "TUIC:   ${PORT_TUIC}"
-        echo "SS2022: ${PORT_SS}"
+        echo "SNI:          ${SB_SNI}"
+        echo "VLESS:        ${PORT_VLESS}"
+        echo "AnyTLS:       ${PORT_ANYTLS}"
+        if warp_ready; then
+            echo "VLESS-WARP:   ${PORT_VLESS_W}"
+            echo "AnyTLS-WARP:  ${PORT_ANYTLS_W}"
+            echo "WARP:         已启用 ${WARP_ENDPOINT_HOST}:${WARP_ENDPOINT_PORT}"
+        else
+            echo "WARP:         未启用"
+        fi
     fi
 }
 
@@ -620,42 +1013,304 @@ singbox_uninstall() {
     done
     require_root
     require_openrc
-    confirm "确认卸载 Alpine sing-box？" "n" || die "已取消卸载。"
+    confirm "确认卸载 Alpine sing-box？" "n" || { info "已取消卸载。"; return 0; }
     service_stop "$SB_SERVICE"
     service_disable "$SB_SERVICE"
-    rm -f -- "$SB_INIT" "$SB_BIN" "$SB_LOG"
+    rm -f -- "$SB_INIT" "$SB_LOG"
+    if [[ -L "$SB_BIN" ]]; then
+        rm -f -- "$SB_BIN"
+    elif [[ -f "$SB_BIN" && "$SB_BIN" == /usr/local/bin/sing-box ]]; then
+        rm -f -- "$SB_BIN"
+    fi
     if ((purge == 1)); then
         [[ "$SB_DIR" == /opt/alpine-sing-box ]] || die "拒绝删除非预期目录：${SB_DIR}"
         rm -rf -- "$SB_DIR"
         ok "已删除服务、二进制和配置。"
     else
-        ok "已删除服务和二进制；配置保留在 ${SB_DIR}"
+        ok "已删除服务；配置保留在 ${SB_DIR}"
     fi
 }
 
-singbox_menu() {
-    local choice
-    printf '%sAlpine sing-box 精简节点 v%s%s\n' "$C_BLUE" "$SB_VERSION_LABEL" "$C_RESET"
-    cat <<'EOF'
-  1) 安装 / 显示链接
-  2) 查看分享链接
-  3) 状态
-  4) 重启
-  5) 更新核心
-  6) 卸载（保留配置）
-  0) 返回
-EOF
-    prompt_value choice "请选择" "1"
+print_custom_routes() {
+    ensure_route_file
+    echo "本机出口: IPv4=$(default_ipv4_address || echo 无) IPv6=$(default_ipv6_address || echo 无)"
+    echo
+    jq -r '
+      def match_text:
+        [(.domain // [] | map("domain:" + .))[],
+         (.domain_suffix // [] | map("suffix:" + .))[],
+         (.domain_keyword // [] | map("keyword:" + .))[],
+         (.domain_regex // [] | map("regex:" + .))[],
+         (.rule_set // [] | map("rule-set:" + .))[]] | join(", ");
+      "自定义路由规则:",
+      (if ((.rules // []) | length) == 0 then "  （无）"
+       else (.rules // [] | to_entries[] | "  \(.key + 1)) \((.value.name // "未命名")) -> \(.value.outbound) | \(.value | match_text)") end),
+      "",
+      "导入的远程出口:",
+      (if ((.outbounds // []) | length) == 0 then "  （无）"
+       else (.outbounds // [] | to_entries[] | "  \(.key + 1)) \(.value.tag) [\(.value.type)]") end)
+    ' "$SB_ROUTE_JSON"
+}
+
+select_route_outbound() {
+    local ip4 ip6 choice idx tag
+    local -a imported=()
+    SBP_SELECTED_OUTBOUND=""
+    ip4="$(default_ipv4_address || true)"
+    ip6="$(default_ipv6_address || true)"
+    mapfile -t imported < <(jq -r '.outbounds[]?.tag' "$SB_ROUTE_JSON")
+    echo "选择这条规则使用的出口："
+    echo "  1) 本机 WARP（warp）"
+    echo "  2) 本机 IPv4（direct-ipv4，当前 ${ip4:-未检测到}）"
+    echo "  3) 本机 IPv6（direct-ipv6，当前 ${ip6:-未检测到}）"
+    idx=4
+    for tag in "${imported[@]:-}"; do
+        [[ -n "$tag" ]] || continue
+        echo "  ${idx}) 导入出口：${tag}"
+        idx=$((idx + 1))
+    done
+    ask choice "选择出口: "
     case "$choice" in
-        1) singbox_install ;;
-        2) print_links ;;
-        3) singbox_status ;;
-        4) singbox_restart ;;
-        5) singbox_update ;;
-        6) singbox_uninstall ;;
-        0) return 0 ;;
-        *) die "无效选择：$choice" ;;
+        1) SBP_SELECTED_OUTBOUND="warp" ;;
+        2) SBP_SELECTED_OUTBOUND="direct-ipv4" ;;
+        3) SBP_SELECTED_OUTBOUND="direct-ipv6" ;;
+        *)
+            if [[ "$choice" =~ ^[0-9]+$ ]]; then
+                idx=$((choice - 4))
+                if ((idx >= 0 && idx < ${#imported[@]})); then
+                    SBP_SELECTED_OUTBOUND="${imported[$idx]}"
+                fi
+            fi
+            ;;
     esac
+    [[ -n "$SBP_SELECTED_OUTBOUND" ]] || { warn "无效出口选择"; return 1; }
+}
+
+add_custom_route_rule() {
+    ensure_route_file
+    select_route_outbound || return 1
+    echo "匹配项，逗号或空格分隔。例：geosite:netflix suffix:openai.com"
+    echo "简写：netflix → geosite；example.com → 域名后缀。"
+    local matches name match_json tmp
+    ask matches "匹配项: "
+    match_json="$(parse_route_match_json "$matches")"
+    if ! printf '%s' "$match_json" | jq -e '
+        (((.domain // [])|length)+((.domain_suffix // [])|length)+((.domain_keyword // [])|length)+((.domain_regex // [])|length)+((.rule_set // [])|length)) > 0
+    ' >/dev/null; then
+        warn "没有可用匹配项。"
+        return 1
+    fi
+    ask name "规则名称（可留空）: "
+    tmp="$(mktemp)"
+    jq -c --argjson match "$match_json" --arg outbound "$SBP_SELECTED_OUTBOUND" --arg name "$name" '
+        .rules = (.rules // [])
+        | .rule_set = (.rule_set // [])
+        | .outbounds = (.outbounds // [])
+        | .rules += [($match | del(.rule_set_defs) + {outbound:$outbound} + (if $name != "" then {name:$name} else {} end))]
+        | .rule_set = ((.rule_set + ($match.rule_set_defs // [])) | unique_by(.tag))
+    ' "$SB_ROUTE_JSON" >"$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$SB_ROUTE_JSON"
+    apply_singbox_config || { warn "应用路由失败。"; return 1; }
+    ok "路由规则已应用。"
+}
+
+import_custom_route_outbound() {
+    ensure_route_file
+    local tag raw outbound tmp
+    ask tag "远程出口 tag（例如 hk-socks）: "
+    valid_route_tag "$tag" || { warn "tag 只能包含字母数字和 ._-@!"; return 1; }
+    case "$tag" in
+        direct|direct-ipv4|direct-ipv6|warp) warn "该 tag 是内置出口。"; return 1 ;;
+    esac
+    echo "粘贴分享链接（优先 socks5h://user:pass@host:port），也支持 VLESS / AnyTLS / SOCKS / HTTP。"
+    ask raw "节点配置: "
+    [[ -f "$raw" ]] && raw="$(cat "$raw")"
+    if printf '%s' "$raw" | jq -e 'type == "object" and (.type | type == "string")' >/dev/null 2>&1; then
+        outbound="$(printf '%s' "$raw" | jq -c --arg tag "$tag" '.tag = $tag')"
+    else
+        outbound="$(share_link_to_outbound "$raw" "$tag" 2>/dev/null || true)"
+    fi
+    if [[ -z "${outbound:-}" ]] || ! printf '%s' "$outbound" | jq -e 'type == "object" and (.type|type=="string")' >/dev/null; then
+        warn "无法识别。socks5h 示例：socks5h://user:pass@203.0.113.8:1080"
+        return 1
+    fi
+    tmp="$(mktemp)"
+    jq -c --argjson outbound "$outbound" '
+        .outbounds = (((.outbounds // []) | map(select(.tag != $outbound.tag))) + [$outbound])
+    ' "$SB_ROUTE_JSON" >"$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$SB_ROUTE_JSON"
+    apply_singbox_config || { warn "导入出口后配置校验失败。"; return 1; }
+    ok "已导入出口：${tag}"
+}
+
+remove_custom_route_rule() {
+    ensure_route_file
+    local idx tmp
+    print_custom_routes
+    ask idx "要删除的规则编号: "
+    [[ "$idx" =~ ^[0-9]+$ ]] || { warn "编号无效"; return 1; }
+    idx=$((idx - 1))
+    tmp="$(mktemp)"
+    jq -c --argjson idx "$idx" '
+        .rules = ((.rules // []) | del(.[$idx]))
+        | ([.rules[]?.rule_set[]?] | unique) as $used
+        | .rule_set = ((.rule_set // []) | map(. as $rs | select($used | index($rs.tag))))
+    ' "$SB_ROUTE_JSON" >"$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$SB_ROUTE_JSON"
+    apply_singbox_config || return 1
+    ok "已删除规则。"
+}
+
+remove_custom_route_outbound() {
+    ensure_route_file
+    local tag tmp
+    print_custom_routes
+    ask tag "要删除的远程出口 tag: "
+    if jq -e --arg tag "$tag" 'any(.rules[]?; .outbound == $tag)' "$SB_ROUTE_JSON" >/dev/null; then
+        warn "该出口仍被规则使用。"
+        return 1
+    fi
+    tmp="$(mktemp)"
+    jq -c --arg tag "$tag" '.outbounds = ((.outbounds // []) | map(select(.tag != $tag)))' "$SB_ROUTE_JSON" >"$tmp" \
+        || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$SB_ROUTE_JSON"
+    apply_singbox_config || return 1
+    ok "已删除出口。"
+}
+
+custom_route_menu() {
+    require_installed
+    ensure_route_file
+    while true; do
+        echo
+        title "自定义路由与分流"
+        print_custom_routes
+        echo
+        echo "  1) 添加网址 / geosite 规则"
+        echo "  2) 导入远程出口（socks5h / 分享链接）"
+        echo "  3) 删除路由规则"
+        echo "  4) 删除导入出口"
+        echo "  0) 返回"
+        local op
+        ask op "请选择: "
+        case "$op" in
+            1) add_custom_route_rule; pause ;;
+            2) import_custom_route_outbound; pause ;;
+            3) remove_custom_route_rule; pause ;;
+            4) remove_custom_route_outbound; pause ;;
+            0|q|Q) return 0 ;;
+            *) warn "无效选择"; sleep 1 ;;
+        esac
+    done
+}
+
+singbox_edit() {
+    require_installed
+    while true; do
+        echo
+        title "编辑节点信息"
+        echo "  入口: ${SB_HOST:-自动探测}   SNI: ${SB_SNI}"
+        echo "  VLESS ${PORT_VLESS}  AnyTLS ${PORT_ANYTLS}  WARP=$(warp_ready && echo 开 || echo 关)"
+        echo
+        echo "  1) 修改入口地址（NAT / 域名）"
+        echo "  2) 修改 SNI / Reality 握手域名"
+        echo "  3) 重新随机端口"
+        echo "  4) 重新生成 UUID / 密钥 / AnyTLS 密码"
+        echo "  5) 重试 / 启用 WARP"
+        echo "  6) 关闭 WARP 节点"
+        echo "  0) 返回"
+        local op val
+        ask op "请选择: "
+        case "$op" in
+            1)
+                ask val "入口地址: "
+                is_valid_host "$val" || { warn "地址无效"; pause; continue; }
+                SB_HOST="$val"
+                apply_singbox_config && ok "已更新入口地址。" || warn "应用失败。"
+                pause
+                ;;
+            2)
+                ask val "SNI（当前 ${SB_SNI}）: "
+                is_valid_host "$val" || { warn "SNI 无效"; pause; continue; }
+                SB_SNI="$val"
+                ensure_self_signed_cert 1
+                apply_singbox_config && ok "已更新 SNI 并重签证书。" || warn "应用失败。"
+                pause
+                ;;
+            3)
+                local ports
+                ports="$(choose_unique_ports 4)"
+                # shellcheck disable=SC2206
+                local -a pa=($ports)
+                PORT_VLESS="${pa[0]}"; PORT_ANYTLS="${pa[1]}"
+                PORT_VLESS_W="${pa[2]}"; PORT_ANYTLS_W="${pa[3]}"
+                apply_singbox_config && ok "端口已更换。" || warn "应用失败。"
+                print_links
+                pause
+                ;;
+            4)
+                UUID="$(generate_uuid)"
+                ANYTLS_PWD="$(random_hex 16)"
+                REALITY_SID="$(random_hex 8)"
+                local kp
+                kp="$("$SB_BIN" generate reality-keypair)" || { warn "生成密钥失败"; pause; continue; }
+                parse_reality_keypair "$kp" || { warn "解析密钥失败"; pause; continue; }
+                apply_singbox_config && ok "凭证已轮换。" || warn "应用失败。"
+                print_links
+                pause
+                ;;
+            5)
+                ENABLE_WARP=true
+                if ensure_warp_profile && apply_singbox_config; then
+                    ok "WARP 已启用。"
+                    print_links
+                else
+                    warn "WARP 未能启用。"
+                fi
+                pause
+                ;;
+            6)
+                ENABLE_WARP=false
+                apply_singbox_config && ok "已关闭 WARP 入站。" || warn "应用失败。"
+                pause
+                ;;
+            0|q|Q) return 0 ;;
+            *) warn "无效选择"; sleep 1 ;;
+        esac
+    done
+}
+
+singbox_menu() {
+    while true; do
+        echo
+        printf '%sAlpine sing-box  v%s%s\n' "$C_BLUE" "$SB_VERSION_LABEL" "$C_RESET"
+        dim "VLESS Reality · AnyTLS · WARP · 自定义分流"
+        echo "────────────────────────────────────────"
+        echo "  1) 安装 / 迁移 / 显示链接"
+        echo "  2) 查看分享链接"
+        echo "  3) 运行状态"
+        echo "  4) 重启服务"
+        echo "  5) 编辑节点信息"
+        echo "  6) 自定义路由与分流"
+        echo "  7) 更新核心"
+        echo "  8) 卸载（保留配置）"
+        echo "  0) 返回主菜单"
+        echo "────────────────────────────────────────"
+        local choice
+        ask choice "请选择: "
+        case "$choice" in
+            1) singbox_install; pause ;;
+            2) print_links; pause ;;
+            3) singbox_status; pause ;;
+            4) singbox_restart; pause ;;
+            5) singbox_edit ;;
+            6) custom_route_menu ;;
+            7) singbox_update; pause ;;
+            8) singbox_uninstall; pause ;;
+            0|q|Q) return 0 ;;
+            *) warn "无效选择"; sleep 1 ;;
+        esac
+    done
 }
 
 singbox_main() {
@@ -664,9 +1319,11 @@ singbox_main() {
     case "$command" in
         menu) singbox_menu "$@" ;;
         install) singbox_install "$@" ;;
-        links|info) require_root; load_sb_state; print_links ;;
+        links|info) require_root; require_installed; print_links ;;
         status) singbox_status "$@" ;;
         restart) singbox_restart "$@" ;;
+        edit) require_root; singbox_edit "$@" ;;
+        routes|route) require_root; custom_route_menu "$@" ;;
         update|upgrade) singbox_update "$@" ;;
         uninstall) singbox_uninstall "$@" ;;
         help|-h|--help) singbox_usage ;;

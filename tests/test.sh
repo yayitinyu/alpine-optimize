@@ -173,41 +173,56 @@ assert_eq "https://example.invalid/glibc" \
     "glibc regex does not match -musl"
 
 # --- sing-box share links ---
-vless="$(vless_share_link 203.0.113.8 443 uuid-1 www.microsoft.com pubk abcd)"
+vless="$(vless_share_link 203.0.113.8 443 uuid-1 www.tokyometro.jp pubk abcd)"
 assert_file_contains <(printf '%s\n' "$vless") "vless://uuid-1@203.0.113.8:443" "vless link host/port"
 assert_file_contains <(printf '%s\n' "$vless") "security=reality" "vless link uses reality"
+assert_file_contains <(printf '%s\n' "$vless") "sni=www.tokyometro.jp" "vless default sni"
 assert_file_contains <(printf '%s\n' "$vless") "pbk=pubk" "vless link includes public key"
 
-hy2="$(hy2_share_link example.com 8443 'p@ss' www.bing.com)"
-assert_file_contains <(printf '%s\n' "$hy2") "hysteria2://p%40ss@example.com:8443" "hy2 password is urlencoded"
-assert_file_contains <(printf '%s\n' "$hy2") "insecure=1" "hy2 marks self-signed cert"
+anytls="$(anytls_share_link example.com 8443 'p@ss' www.tokyometro.jp)"
+assert_file_contains <(printf '%s\n' "$anytls") "anytls://p%40ss@example.com:8443" "anytls password is urlencoded"
+assert_file_contains <(printf '%s\n' "$anytls") "insecure=1" "anytls marks self-signed cert"
+assert_file_contains <(printf '%s\n' "$anytls") "sni=www.tokyometro.jp" "anytls sni"
+
+socks_ob="$(share_link_to_outbound 'socks5h://user:p%40ss@203.0.113.8:1080' hk-socks)"
+printf '%s' "$socks_ob" | grep -q '"type":"socks"' || fail "socks5h import type"
+printf '%s' "$socks_ob" | grep -q '"server":"203.0.113.8"' || fail "socks5h import host"
+printf '%s' "$socks_ob" | grep -q '"username":"user"' || fail "socks5h import user"
+printf '%s' "$socks_ob" | grep -q '"password":"p@ss"' || fail "socks5h import password"
+pass "socks5h share link is imported"
+
+match_json="$(parse_route_match_json 'geosite:netflix suffix:openai.com')"
+printf '%s' "$match_json" | grep -q 'geosite-netflix' || fail "geosite match expands"
+printf '%s' "$match_json" | grep -q 'openai.com' || fail "suffix match is kept"
+pass "route match parser accepts geosite and suffix"
 
 # JSON renderer
 UUID="11111111-1111-1111-1111-111111111111"
-TUIC_UUID="22222222-2222-2222-2222-222222222222"
 REALITY_PRIV="priv"
 REALITY_PUB="pub"
 REALITY_SID="abcd1234"
-HY2_PWD="hy2pass"
-TUIC_PWD="tuicpass"
-SS_KEY="sskey+/="
+ANYTLS_PWD="anytls-pass"
 PORT_VLESS=20001
-PORT_HY2=20002
-PORT_TUIC=20003
-PORT_SS=20004
+PORT_ANYTLS=20002
+PORT_VLESS_W=20003
+PORT_ANYTLS_W=20004
 SB_ALLOW_PRIVATE=0
+ENABLE_WARP=false
 SB_LISTEN="0.0.0.0"
-SB_SNI="www.microsoft.com"
-SB_TLS_SNI="www.bing.com"
+SB_SNI="www.tokyometro.jp"
 SB_LOG="/tmp/sb.log"
 SB_CERT_DIR="/tmp/cert"
+SB_DIR="${TEST_TMP:-/tmp}"
+SB_ROUTE_JSON="$(mktemp)"
+register_temp "$SB_ROUTE_JSON"
+empty_route_json >"$SB_ROUTE_JSON"
 json="$(render_singbox_config)"
 printf '%s' "$json" | grep -q '"type": "vless"' || fail "config contains vless"
-printf '%s' "$json" | grep -q '"type": "hysteria2"' || fail "config contains hysteria2"
-printf '%s' "$json" | grep -q '"type": "tuic"' || fail "config contains tuic"
-printf '%s' "$json" | grep -q '"type": "shadowsocks"' || fail "config contains shadowsocks"
+printf '%s' "$json" | grep -q '"type": "anytls"' || fail "config contains anytls"
+printf '%s' "$json" | grep -q 'hysteria2' && fail "config should not contain hysteria2"
+printf '%s' "$json" | grep -q '"www.tokyometro.jp"' || fail "config uses tokyometro sni"
 printf '%s' "$json" | grep -q '"ip_is_private": true' || fail "default config rejects private"
-pass "sing-box config contains four inbounds and private reject"
+pass "sing-box config is VLESS+AnyTLS with private reject"
 
 SB_ALLOW_PRIVATE=1
 json_open="$(render_singbox_config)"

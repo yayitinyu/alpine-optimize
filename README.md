@@ -67,14 +67,14 @@ bash /opt/alpine-optimize/alpine.sh self-update
 | 1 | 系统优化分项：BBR、limits、SWAP、磁盘、工具、清理、引导、时间、熵源 |
 | 2 | Realm 端口转发（OpenRC，官方 musl 包） |
 | 3 | Dante SOCKS5 |
-| 4 | 精简 sing-box：VLESS Reality / Hysteria2 / TUIC v5 / SS2022 |
+| 4 | sing-box：VLESS Reality + AnyTLS，可选 WARP，自定义分流 / socks5h 导入 |
 | 5 | SSH 密钥（可选关密码，默认否） |
 | 6 | 查看优化与服务状态 |
 | 7 | 卸载优化配置 |
 
 一键优化包含：community 源、GNU 工具、BBR+网络、资源限制、SWAP、noatime、运维工具、每日清理、chrony、haveged。
 
-sing-box 不提供 20 节点、WARP、ACME。Alpine 小鸡内存有限，四条常用入站更合适。
+sing-box 入站为 **VLESS Reality** 与 **AnyTLS**（直连 + WARP 各一条）。可在菜单里改 SNI、端口、凭证，并导入 `socks5h://` 等远程出口做分流。默认 Reality / AnyTLS SNI 为 `www.tokyometro.jp`。
 
 ---
 

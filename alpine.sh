@@ -240,7 +240,7 @@ show_main_menu() {
     echo "  1) 系统优化（分项菜单）"
     echo "  2) Realm 端口转发"
     echo "  3) SOCKS5 节点（Dante）"
-    echo "  4) sing-box 精简节点"
+    echo "  4) sing-box（VLESS / AnyTLS / WARP）"
     echo "  5) SSH 密钥登录"
     echo "  6) 查看优化状态"
     echo "  7) 卸载优化配置"
