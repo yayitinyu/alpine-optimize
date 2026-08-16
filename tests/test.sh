@@ -228,6 +228,41 @@ SB_ALLOW_PRIVATE=1
 json_open="$(render_singbox_config)"
 printf '%s' "$json_open" | grep -q '"ip_is_private": true' && fail "allow-private should omit reject rule"
 pass "allow-private omits private reject rule"
+SB_ALLOW_PRIVATE=0
+
+# --- single-node mode (NAT boxes with one forwarded port) ---
+assert_eq "vless" "$(normalize_single_proto VLESS)" "protocol name is normalized"
+assert_eq "anytls" "$(normalize_single_proto AnyTLS)" "anytls name is normalized"
+assert_false "unknown protocol is rejected" normalize_single_proto hysteria2
+
+assert_eq "2" "$(node_plan_json | jq 'length')" "full mode without warp plans 2 inbounds"
+
+SB_MODE="single"
+SB_SINGLE_PROTO="anytls"
+SB_SINGLE_PORT=34567
+SB_SINGLE_WARP=0
+json_single="$(render_singbox_config)"
+assert_eq "1" "$(printf '%s' "$json_single" | jq '.inbounds | length')" \
+    "single mode renders exactly one inbound"
+assert_eq "anytls" "$(printf '%s' "$json_single" | jq -r '.inbounds[0].type')" \
+    "single mode honours the chosen protocol"
+assert_eq "34567" "$(printf '%s' "$json_single" | jq -r '.inbounds[0].listen_port')" \
+    "single mode listens on the requested port"
+assert_eq "0" "$(printf '%s' "$json_single" | jq '[.route.rules[] | select(.outbound == "warp")] | length')" \
+    "direct single node has no warp route rule"
+
+SB_LINKS="$(mktemp)"
+register_temp "$SB_LINKS"
+SB_HOST="203.0.113.9"
+SB_SINGLE_PROTO="vless"
+write_share_links
+assert_eq "1" "$(grep -c '://' "$SB_LINKS")" "single mode writes exactly one share link"
+assert_file_contains "$SB_LINKS" "vless://${UUID}@203.0.113.9:34567" \
+    "single-node link uses the fixed port"
+
+SB_MODE="full"
+write_share_links
+assert_eq "2" "$(grep -c '://' "$SB_LINKS")" "full mode without warp writes two share links"
 
 if command -v python >/dev/null 2>&1; then
     printf '%s' "$json" | python -c 'import json,sys; json.load(sys.stdin)' || fail "rendered config is valid JSON"

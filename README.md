@@ -76,6 +76,8 @@ bash /opt/alpine-optimize/alpine.sh self-update
 
 sing-box 入站为 **VLESS Reality** 与 **AnyTLS**（直连 + WARP 各一条）。可在菜单里改 SNI、端口、凭证，并导入 `socks5h://` 等远程出口做分流。默认 Reality / AnyTLS SNI 为 `www.tokyometro.jp`。
 
+只有少量映射端口的 **NAT 小鸡**，可用子菜单 `2) 单节点` 或 `install --single`：只开一个入站、端口自选，其余节点不再占用端口。已安装时切换会保留原有 UUID / Reality 密钥 / AnyTLS 密码。
+
 ---
 
 ## 本地命令
@@ -88,6 +90,7 @@ bash alpine.sh optimize --bbr --bandwidth 1000 --region asia -y
 bash alpine.sh realm install --listen 23456 --remote 1.1.1.1:443
 bash alpine.sh socks install --port 35678 --host nat.example.com
 bash alpine.sh sing-box install --host nat.example.com
+bash alpine.sh sing-box install --single vless --port 45678 --host nat.example.com
 bash alpine.sh status
 bash alpine.sh self-update
 bash alpine.sh uninstall
