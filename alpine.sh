@@ -56,10 +56,6 @@ resolve_root_dir() {
                 ;;
         esac
     fi
-    if is_complete_tree "$ALPINE_OPTIMIZE_HOME"; then
-        printf '%s\n' "$ALPINE_OPTIMIZE_HOME"
-        return 0
-    fi
     return 1
 }
 
@@ -84,8 +80,13 @@ bootstrap_repo() {
 
     if command -v git >/dev/null 2>&1; then
         if [[ -d "${dest}/.git" ]]; then
-            git -C "$dest" fetch --depth 1 origin "$ALPINE_OPTIMIZE_BRANCH" \
-                && git -C "$dest" checkout -q FETCH_HEAD
+            git -C "$dest" fetch --depth 1 origin "$ALPINE_OPTIMIZE_BRANCH" 2>/dev/null \
+                && git -C "$dest" reset --hard "origin/${ALPINE_OPTIMIZE_BRANCH}" 2>/dev/null \
+                && git -C "$dest" clean -fd 2>/dev/null \
+                || {
+                    rm -rf "$dest"
+                    git clone --depth 1 --branch "$ALPINE_OPTIMIZE_BRANCH" "$repo_url" "$dest"
+                }
         else
             rm -rf "$dest"
             git clone --depth 1 --branch "$ALPINE_OPTIMIZE_BRANCH" "$repo_url" "$dest"
@@ -175,7 +176,8 @@ self_update() {
     info "更新 ${ALPINE_OPTIMIZE_REPO}@${ALPINE_OPTIMIZE_BRANCH} ..."
     if [[ -d "${ROOT_DIR}/.git" ]] && command_exists git; then
         git -C "$ROOT_DIR" fetch --depth 1 origin "$ALPINE_OPTIMIZE_BRANCH" \
-            && git -C "$ROOT_DIR" checkout -q FETCH_HEAD \
+            && git -C "$ROOT_DIR" reset --hard "origin/${ALPINE_OPTIMIZE_BRANCH}" \
+            && git -C "$ROOT_DIR" clean -fd \
             || die "git 更新失败。"
         ok "脚本已更新：${ROOT_DIR}"
         return 0
