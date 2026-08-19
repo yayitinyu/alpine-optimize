@@ -1247,17 +1247,24 @@ singbox_install() {
             print_links
             return 0
         fi
-        if ! service_is_active "$SB_SERVICE"; then
-            info "检测到历史配置但服务未运行，正在重新应用并启动服务..."
-            ensure_system_user "$SB_USER"
-            ensure_warp_profile || true
-            apply_singbox_config || die "启动失败。"
-            ok "sing-box 已恢复并启动。"
-        else
-            info "检测到已有安装，显示现有链接。覆盖请加 --force。"
+        if [[ -t 0 || -e /dev/tty ]]; then
+            if confirm "检测到已有安装，是否覆盖重装（重新分配端口与凭据）？" "n"; then
+                CLI_FORCE=1
+            fi
         fi
-        print_links
-        return 0
+        if ((CLI_FORCE != 1)); then
+            if ! service_is_active "$SB_SERVICE"; then
+                info "检测到历史配置但服务未运行，正在重新应用并启动服务..."
+                ensure_system_user "$SB_USER"
+                ensure_warp_profile || true
+                apply_singbox_config || die "启动失败。"
+                ok "sing-box 已恢复并启动。"
+            else
+                info "检测到已有安装，显示现有链接。覆盖请选重装或加 --force。"
+            fi
+            print_links
+            return 0
+        fi
     fi
 
     mkdir -p "$SB_DIR" "$SB_DATA_DIR" "$SB_CERT_DIR"
@@ -1680,11 +1687,11 @@ singbox_menu() {
         printf '%sAlpine sing-box  v%s%s\n' "$C_BLUE" "$SB_VERSION_LABEL" "$C_RESET"
         dim "VLESS Reality · AnyTLS · WARP · 自定义分流"
         echo "────────────────────────────────────────"
-        echo "  1) 安装 / 迁移 / 显示链接"
+        echo "  1) 安装 / 覆盖重装（多节点，随机端口）"
         echo "  2) 单节点（指定端口，适配 NAT）"
         echo "  3) 查看分享链接"
         echo "  4) 运行状态"
-        echo "  5) 重启服务"
+        echo "  5) 启动 / 重启服务"
         echo "  6) 编辑节点信息"
         echo "  7) 自定义路由与分流"
         echo "  8) 更新核心"
