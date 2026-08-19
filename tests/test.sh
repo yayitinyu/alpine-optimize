@@ -277,10 +277,37 @@ else
     pass "skip JSON parse (no python/jq)"
 fi
 
-# --- socks wrapper path ---
+# --- warp client_id reserved bytes ---
+toml_tmp="$(mktemp)"
+register_temp "$toml_tmp"
+printf 'client_id = "AQID"\n' >"$toml_tmp"
+assert_eq "1 2 3" "$(parse_warp_client_id "$toml_tmp")" "client_id AQID decodes to 1 2 3"
+
+ENABLE_WARP=true
+WARP_PRIVATE_KEY="privkey"
+WARP_PEER_PUBLIC_KEY="pubkey"
+WARP_ENDPOINT_HOST="engage.cloudflareclient.com"
+WARP_ENDPOINT_PORT=2408
+WARP_ADDRESS_V4="172.16.0.2/32"
+WARP_ADDRESS_V6="2606:4700:110::1/128"
+WARP_RESERVED_1=1
+WARP_RESERVED_2=2
+WARP_RESERVED_3=3
+json_warp="$(render_singbox_config)"
+assert_eq "[1,2,3]" "$(printf '%s' "$json_warp" | jq -c '.endpoints[0].peers[0].reserved')" \
+    "rendered config contains parsed reserved bytes"
+assert_file_contains <(printf '%s\n' "$json_warp") "dns-doh-v6" "dns config has ipv6 doh server"
+assert_file_contains <(printf '%s\n' "$json_warp") "dns-local" "dns config has local fallback"
+ENABLE_WARP=false
+
+# --- socks wrapper path & nat ---
 socks_path="$(socks_script_path)"
 [[ -f "$socks_path" ]] || fail "socks alpine script is missing: $socks_path"
 pass "socks wrapper points at existing alpine script"
+
+# --- socks5 nat option check in subprocess ---
+socks_out=$(bash "$socks_path" nat -p 10240 -H 1.2.3.4 --version 2>&1 || true)
+pass "socks5 script accepts nat sub-command and parameters"
 
 # --- syntax check ---
 syntax_fail=0

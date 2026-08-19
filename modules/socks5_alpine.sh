@@ -120,11 +120,12 @@ Alpine Linux SOCKS5 一键安装脚本 (OpenRC)
 
 用法：
   bash socks5_alpine.sh [install] [选项]
+  bash socks5_alpine.sh nat [选项]
   bash socks5_alpine.sh info
   bash socks5_alpine.sh uninstall [--yes]
 
 安装选项：
-  -p, --port PORT          指定监听端口；默认在 20000-60000 中随机选择
+  -p, --port PORT          指定监听端口（NAT 请填已映射的端口）；默认随机选择
   -H, --host HOST          指定连接入口地址（IPv4 或域名，用于 NAT VPS）
   -u, --username USER      指定认证用户名；默认随机生成
   -P, --password PASS      指定认证密码；默认随机生成
@@ -260,6 +261,10 @@ parse_args() {
                 ACTION=$1
                 shift
                 ;;
+            nat)
+                ACTION="nat"
+                shift
+                ;;
             help)
                 usage
                 exit 0
@@ -346,8 +351,8 @@ parse_args() {
         CONFIG_OVERRIDES=1
     fi
 
-    if [[ "$ACTION" != "install" && $CONFIG_OVERRIDES -eq 1 ]]; then
-        die "安装参数只能与 install 动作一起使用。"
+    if [[ "$ACTION" != "install" && "$ACTION" != "nat" && $CONFIG_OVERRIDES -eq 1 ]]; then
+        die "安装参数只能与 install 或 nat 动作一起使用。"
     fi
 }
 
@@ -683,7 +688,24 @@ detect_external_interface() {
         ')
     fi
 
-    [[ "$interface" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "无法确定安全的 IPv4 出口网卡。"
+    if [[ -z "$interface" ]]; then
+        interface=$(ip -6 route show default 2>/dev/null | awk '
+            {
+                for (i = 1; i <= NF; i++) {
+                    if ($i == "dev" && (i + 1) <= NF) {
+                        print $(i + 1)
+                        exit
+                    }
+                }
+            }
+        ')
+    fi
+
+    if [[ -z "$interface" ]]; then
+        interface=$(ip link 2>/dev/null | awk -F': ' '$2 != "lo" && $2 ~ /^[a-zA-Z0-9_.:-]+/ {gsub(/@.*/, "", $2); print $2; exit}')
+    fi
+
+    [[ "$interface" =~ ^[A-Za-z0-9_.:-]{1,15}$ ]] || die "无法确定安全的出口网卡。"
     printf '%s\n' "$interface"
 }
 
@@ -1641,6 +1663,45 @@ uninstall_action() {
     log_success "socks5-node 已卸载；发行版的 Dante 软件包被保留。"
 }
 
+nat_prompt() {
+    local port host
+
+    if [[ -z "$CLI_PORT" ]]; then
+        printf '\n%sNAT 模式安装（指定端口与入口地址）%s\n' "$COLOR_BOLD" "$COLOR_RESET"
+        printf '适合只有少量映射端口的 NAT VPS / 容器。\n\n'
+        printf '监听端口（NAT 请填已映射的端口，如 10240）: '
+        if [[ -e /dev/tty ]]; then
+            IFS= read -r port </dev/tty || true
+        else
+            IFS= read -r port || true
+        fi
+        if [[ -n "$port" ]]; then
+            is_valid_port "$port" || die "端口必须是 1025-65535 之间的整数：${port}"
+            CLI_PORT="$port"
+            CONFIG_OVERRIDES=1
+        else
+            die "NAT 模式必须指定监听端口。"
+        fi
+    fi
+
+    if [[ -z "$CLI_HOST" ]]; then
+        printf '连接入口地址（NAT 公网 IP 或域名，留空自动检测）: '
+        if [[ -e /dev/tty ]]; then
+            IFS= read -r host </dev/tty || true
+        else
+            IFS= read -r host || true
+        fi
+        if [[ -n "$host" ]]; then
+            is_valid_host "$host" || die "入口地址格式无效：${host}"
+            CLI_HOST="$host"
+            CONFIG_OVERRIDES=1
+        fi
+    fi
+
+    ACTION="install"
+    install_action
+}
+
 main() {
     parse_args "$@"
     require_root_and_openrc
@@ -1648,6 +1709,7 @@ main() {
 
     case "$ACTION" in
         install) install_action ;;
+        nat) nat_prompt ;;
         info) info_action ;;
         uninstall) uninstall_action ;;
         *) die "未知动作：${ACTION}" ;;

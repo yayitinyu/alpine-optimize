@@ -377,6 +377,13 @@ download_singbox() {
     die "下载的 sing-box 无法在当前系统运行。Alpine 请使用官方 linux-${goarch}-musl 包。"
 }
 
+ensure_singbox_binary() {
+    local version="${1:-${SB_TAG:-latest}}"
+    if [[ ! -x "$SB_BIN" ]] || ! singbox_probe "$SB_BIN" >/dev/null 2>&1; then
+        download_singbox "$version"
+    fi
+}
+
 install_wgcf() {
     [[ -x "$WGCF_BIN" ]] && singbox_probe "$WGCF_BIN" && return 0
     local goarch url tmp json
@@ -400,6 +407,23 @@ install_wgcf() {
     install -m 0755 "${tmp}/wgcf" "$WGCF_BIN"
 }
 
+parse_warp_client_id() {
+    local toml_file="$1" cid bytes r1 r2 r3
+    [[ -f "$toml_file" ]] || return 1
+    cid="$(awk -F'=' '/^[[:space:]]*client_id/{v=$2; gsub(/["'\''\r[:space:]]/,"",v); print v; exit}' "$toml_file" 2>/dev/null || true)"
+    [[ -n "$cid" ]] || return 1
+    bytes="$(printf '%s' "$cid" | openssl base64 -d -A 2>/dev/null | od -An -tuC 2>/dev/null || true)"
+    if [[ -z "$bytes" ]]; then
+        bytes="$(printf '%s' "$cid" | base64 -d 2>/dev/null | od -An -tuC 2>/dev/null || true)"
+    fi
+    IFS=' ' read -r r1 r2 r3 <<< "$bytes"
+    if [[ -n "${r1:-}" && -n "${r2:-}" && -n "${r3:-}" ]]; then
+        printf '%s %s %s\n' "$r1" "$r2" "$r3"
+        return 0
+    fi
+    return 1
+}
+
 ensure_warp_profile() {
     [[ "${ENABLE_WARP}" == "true" ]] || return 1
     if [[ -f "$SB_WARP_ENV" ]]; then
@@ -410,6 +434,13 @@ ensure_warp_profile() {
         : "${WARP_RESERVED_1:=0}" "${WARP_RESERVED_2:=0}" "${WARP_RESERVED_3:=0}"
         if [[ -n "$WARP_PRIVATE_KEY" && -n "$WARP_PEER_PUBLIC_KEY" \
             && -n "${WARP_ENDPOINT_HOST:-}" && -n "${WARP_ENDPOINT_PORT:-}" ]]; then
+            # If reserved bytes are all 0, try to recover from client_id
+            if [[ "$WARP_RESERVED_1" == "0" && "$WARP_RESERVED_2" == "0" && "$WARP_RESERVED_3" == "0" ]]; then
+                local cid_res
+                if cid_res="$(parse_warp_client_id "${SB_DIR}/wgcf/wgcf-account.toml")"; then
+                    IFS=' ' read -r WARP_RESERVED_1 WARP_RESERVED_2 WARP_RESERVED_3 <<< "$cid_res"
+                fi
+            fi
             save_warp_env
             return 0
         fi
@@ -417,7 +448,7 @@ ensure_warp_profile() {
 
     install_wgcf || { warn "wgcf 安装失败，已禁用 WARP 节点。"; ENABLE_WARP=false; return 1; }
 
-    local wd="${SB_DIR}/wgcf" prof ep host port ad rs
+    local wd="${SB_DIR}/wgcf" prof ep host port ad rs addr
     mkdir -p "$wd"
     if [[ ! -f "$wd/wgcf-account.toml" ]]; then
         info "正在注册 WARP 账户..."
@@ -444,14 +475,34 @@ ensure_warp_profile() {
     fi
     WARP_ENDPOINT_HOST="$host"
     WARP_ENDPOINT_PORT="$port"
-    ad="$(awk -F'= *' '/^Address/{gsub(/\r/,"");print $2; exit}' "$prof" | tr -d '" ')"
-    WARP_ADDRESS_V4="${ad%%,*}"
-    WARP_ADDRESS_V6="${ad##*,}"
-    [[ "$WARP_ADDRESS_V4" == "$WARP_ADDRESS_V6" ]] && WARP_ADDRESS_V6=""
-    rs="$(awk -F'= *' '/^Reserved/{gsub(/\r/,"");print $2; exit}' "$prof" | tr -d '" ')"
-    WARP_RESERVED_1="${rs%%,*}"; rs="${rs#*,}"
-    WARP_RESERVED_2="${rs%%,*}"; WARP_RESERVED_3="${rs##*,}"
+
+    ad="$(awk -F'= *' '/^Address/{gsub(/\r/,"");print $2; exit}' "$prof" | tr -d '"')"
+    WARP_ADDRESS_V4=""
+    WARP_ADDRESS_V6=""
+    IFS=',' read -r -a addr_list <<< "$ad"
+    for addr in "${addr_list[@]:-}"; do
+        addr="$(echo "$addr" | tr -d '[:space:]')"
+        if [[ "$addr" == *.* && "$addr" == */* ]]; then
+            WARP_ADDRESS_V4="$addr"
+        elif [[ "$addr" == *:* && "$addr" == */* ]]; then
+            WARP_ADDRESS_V6="$addr"
+        fi
+    done
+
+    # 1. Try to read reserved from profile.conf
+    rs="$(awk -F'= *' '/^Reserved/{gsub(/\r/,"");print $2; exit}' "$prof" 2>/dev/null | tr -d '" ')"
+    if [[ -n "$rs" ]]; then
+        WARP_RESERVED_1="${rs%%,*}"; rs="${rs#*,}"
+        WARP_RESERVED_2="${rs%%,*}"; WARP_RESERVED_3="${rs##*,}"
+    fi
+
+    # 2. Decode client_id from wgcf-account.toml (essential for Cloudflare WARP on WireGuard)
+    local cid_res
+    if cid_res="$(parse_warp_client_id "$wd/wgcf-account.toml")"; then
+        IFS=' ' read -r WARP_RESERVED_1 WARP_RESERVED_2 WARP_RESERVED_3 <<< "$cid_res"
+    fi
     : "${WARP_RESERVED_1:=0}" "${WARP_RESERVED_2:=0}" "${WARP_RESERVED_3:=0}"
+
     if [[ -z "$WARP_PRIVATE_KEY" || -z "$WARP_PEER_PUBLIC_KEY" || -z "$WARP_ENDPOINT_HOST" ]]; then
         warn "WARP 配置不完整，已禁用 WARP 节点。"
         ENABLE_WARP=false
@@ -707,6 +758,11 @@ render_singbox_config() {
     local warp="false"
     warp_ready && warp="true"
 
+    local dns_strategy="prefer_ipv4"
+    if [[ -z "$(default_ipv4_address || true)" && -n "$(default_ipv6_address || true)" ]]; then
+        dns_strategy="prefer_ipv6"
+    fi
+
     jq -n \
         --arg LOG "$SB_LOG" --arg LISTEN "$listen" --arg SNI "$SB_SNI" \
         --arg CRT "${SB_CERT_DIR}/cert.pem" --arg KEY "${SB_CERT_DIR}/key.pem" \
@@ -720,6 +776,7 @@ render_singbox_config() {
         --argjson WR1 "${WARP_RESERVED_1:-0}" --argjson WR2 "${WARP_RESERVED_2:-0}" --argjson WR3 "${WARP_RESERVED_3:-0}" \
         --argjson WKA "${WARP_KEEPALIVE_INTERVAL:-25}" \
         --argjson CUSTOM "$routes" \
+        --arg STRATEGY "$dns_strategy" \
         --arg BIND4 "$(default_ipv4_address || true)" --arg BIND6 "$(default_ipv6_address || true)" '
         def inbound_vless($port; $tag):
           {type:"vless", tag:$tag, listen:$LISTEN, listen_port:$port,
@@ -749,10 +806,14 @@ render_singbox_config() {
             servers:[
               {type:"https", tag:"dns-doh-primary", server:"1.1.1.1", path:"/dns-query",
                tls:{enabled:true, server_name:"cloudflare-dns.com"}},
-              {type:"udp", tag:"dns-udp-fallback", server:"1.0.0.1"}
+              {type:"https", tag:"dns-doh-v6", server:"2606:4700:4700::1111", path:"/dns-query",
+               tls:{enabled:true, server_name:"cloudflare-dns.com"}},
+              {type:"udp", tag:"dns-udp-fallback", server:"1.0.0.1"},
+              {type:"udp", tag:"dns-udp-v6-fallback", server:"2606:4700:4700::1001"},
+              {type:"local", tag:"dns-local"}
             ],
             final:"dns-doh-primary",
-            strategy:"prefer_ipv4"
+            strategy:$STRATEGY
           },
           endpoints: (if $WARP and ((($WARP_TAGS | length) > 0) or uses("warp")) then [{
             type:"wireguard", tag:"warp", system:false,
@@ -865,6 +926,15 @@ load_sb_state() {
     [[ -f "$SB_WARP_ENV" ]] && { # shellcheck disable=SC1090
         source "$SB_WARP_ENV"
     }
+    if [[ -f "${SB_DIR}/wgcf/wgcf-account.toml" ]]; then
+        if [[ "${WARP_RESERVED_1:-0}" == "0" && "${WARP_RESERVED_2:-0}" == "0" && "${WARP_RESERVED_3:-0}" == "0" ]]; then
+            local cid_res
+            if cid_res="$(parse_warp_client_id "${SB_DIR}/wgcf/wgcf-account.toml")"; then
+                IFS=' ' read -r WARP_RESERVED_1 WARP_RESERVED_2 WARP_RESERVED_3 <<< "$cid_res"
+                save_warp_env
+            fi
+        fi
+    fi
     migrate_legacy_state
 }
 
@@ -935,6 +1005,8 @@ EOF
 
 apply_singbox_config() {
     local tmp_conf conf_bak
+    ensure_singbox_binary "${SB_TAG:-latest}"
+    ensure_system_user "$SB_USER"
     ensure_self_signed_cert
     ensure_route_file
     tmp_conf="$(mktemp "${SB_DIR}/config.json.tmp.XXXXXX")"
@@ -986,8 +1058,14 @@ print_links() {
 }
 
 require_installed() {
-    [[ -f "$SB_STATE" && -x "$SB_BIN" ]] || die "尚未安装，请先选择安装。"
+    [[ -f "$SB_STATE" ]] || die "尚未安装，请先选择安装。"
     load_sb_state
+    if [[ ! -x "$SB_BIN" ]] || ! service_is_active "$SB_SERVICE"; then
+        info "检测到历史配置但程序或服务未就绪，正在恢复..."
+        singbox_prepare
+        ensure_singbox_binary "${SB_TAG:-latest}"
+        apply_singbox_config || die "恢复失败。"
+    fi
 }
 
 # A port already held by one of our own inbounds is not a conflict.
@@ -1091,8 +1169,10 @@ singbox_single_entry() {
     dim "只监听一个端口，适合只有少量映射端口的 NAT 小鸡。"
     prompt_single_node || return 1
 
-    if [[ -f "$SB_STATE" && -x "$SB_BIN" ]]; then
+    if [[ -f "$SB_STATE" ]]; then
+        singbox_prepare
         load_sb_state
+        ensure_singbox_binary "${SB_TAG:-latest}"
         apply_single_node_settings "$SBP_SINGLE_PROTO" "$SBP_SINGLE_PORT" "$SBP_SINGLE_WARP" || return 1
         apply_singbox_config || { warn "应用失败。"; return 1; }
         ok "已切换为单节点：${SB_SINGLE_PROTO} :${SB_SINGLE_PORT}"
@@ -1148,6 +1228,7 @@ singbox_install() {
     singbox_prepare
     if [[ -f "$SB_STATE" && "$CLI_FORCE" -ne 1 ]]; then
         load_sb_state
+        ensure_singbox_binary "$SB_TAG"
         if ((CLI_SINGLE == 1)); then
             info "正在切换为单节点模式（保留现有凭证）..."
             apply_single_node_settings "$CLI_SINGLE_PROTO" "$CLI_SINGLE_PORT" "$CLI_SINGLE_WARP" \
@@ -1166,7 +1247,15 @@ singbox_install() {
             print_links
             return 0
         fi
-        info "检测到已有安装，显示现有链接。覆盖请加 --force。"
+        if ! service_is_active "$SB_SERVICE"; then
+            info "检测到历史配置但服务未运行，正在重新应用并启动服务..."
+            ensure_system_user "$SB_USER"
+            ensure_warp_profile || true
+            apply_singbox_config || die "启动失败。"
+            ok "sing-box 已恢复并启动。"
+        else
+            info "检测到已有安装，显示现有链接。覆盖请加 --force。"
+        fi
         print_links
         return 0
     fi
