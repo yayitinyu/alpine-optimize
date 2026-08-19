@@ -1330,12 +1330,17 @@ singbox_update() {
 singbox_status() {
     require_root
     if [[ -x "$SB_BIN" ]]; then
-        "$SB_BIN" version || true
+        "$SB_BIN" version 2>/dev/null || true
     fi
     if service_is_active "$SB_SERVICE"; then
         ok "服务运行中：${SB_SERVICE}"
     else
         warn "服务未运行：${SB_SERVICE}"
+        if [[ -f "$SB_STATE" && ! -x "$SB_BIN" ]]; then
+            dim "（二进制缺失，请在子菜单选择【1】或【2】完成安装与启动）"
+        elif [[ -f "$SB_STATE" ]]; then
+            dim "（请在子菜单选择【1】或【5】启动服务）"
+        fi
     fi
     if [[ -f "$SB_STATE" ]]; then
         load_sb_state
@@ -1369,6 +1374,15 @@ singbox_status() {
 singbox_restart() {
     require_root
     require_openrc
+    if [[ ! -f "$SB_STATE" ]]; then
+        die "尚未安装，请先选择安装。"
+    fi
+    if [[ ! -x "$SB_BIN" || ! -f "$SB_INIT" ]]; then
+        info "检测到程序或服务未就绪，正在重新应用并启动服务..."
+        apply_singbox_config || die "启动失败。"
+        ok "sing-box 已启动。"
+        return 0
+    fi
     service_restart "$SB_SERVICE" || die "重启失败。"
     ok "已重启 ${SB_SERVICE}"
 }
