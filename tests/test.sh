@@ -217,6 +217,10 @@ SB_ROUTE_JSON="$(mktemp)"
 register_temp "$SB_ROUTE_JSON"
 empty_route_json >"$SB_ROUTE_JSON"
 json="$(render_singbox_config)"
+assert_eq "2" "$(printf '%s' "$json" | jq '[.dns.servers[] | select(.tag == "dns-doh-primary" or .tag == "dns-doh-v6") | select(.tls.enabled == true)] | length')" \
+    "DoH resolvers keep TLS enabled"
+assert_eq "false" "$(printf '%s' "$json" | jq '[.dns.servers[] | select(.tag == "dns-doh-primary" or .tag == "dns-doh-v6") | (.tls | has("server_name"))] | any')" \
+    "DoH resolvers do not force SNI"
 printf '%s' "$json" | grep -q '"type": "vless"' || fail "config contains vless"
 printf '%s' "$json" | grep -q '"type": "anytls"' || fail "config contains anytls"
 printf '%s' "$json" | grep -q 'hysteria2' && fail "config should not contain hysteria2"

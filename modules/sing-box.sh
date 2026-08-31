@@ -763,6 +763,8 @@ render_singbox_config() {
         dns_strategy="prefer_ipv6"
     fi
 
+    # The resolver certificates cover their literal IPs; forced hostname SNI is
+    # reset by some NAT egress paths even though IP-based TLS verification works.
     jq -n \
         --arg LOG "$SB_LOG" --arg LISTEN "$listen" --arg SNI "$SB_SNI" \
         --arg CRT "${SB_CERT_DIR}/cert.pem" --arg KEY "${SB_CERT_DIR}/key.pem" \
@@ -805,9 +807,9 @@ render_singbox_config() {
           dns:{
             servers:[
               {type:"https", tag:"dns-doh-primary", server:"1.1.1.1", path:"/dns-query",
-               tls:{enabled:true, server_name:"cloudflare-dns.com"}},
+               tls:{enabled:true}},
               {type:"https", tag:"dns-doh-v6", server:"2606:4700:4700::1111", path:"/dns-query",
-               tls:{enabled:true, server_name:"cloudflare-dns.com"}},
+               tls:{enabled:true}},
               {type:"udp", tag:"dns-udp-fallback", server:"1.0.0.1"},
               {type:"udp", tag:"dns-udp-v6-fallback", server:"2606:4700:4700::1001"},
               {type:"local", tag:"dns-local"}
