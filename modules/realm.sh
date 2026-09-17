@@ -7,7 +7,7 @@ if [[ -z "${ALPINE_OPTIMIZE_COMMON:-}" ]]; then
     . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
 fi
 
-REALM_SCRIPT_VERSION="1.0.0"
+REALM_SCRIPT_VERSION="1.1.0"
 GITHUB_REPO="zhboner/realm"
 GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}"
 
@@ -38,7 +38,8 @@ Realm 端口转发管理（Alpine / OpenRC）
   alpine.sh realm                         打开交互式菜单
   alpine.sh realm install [选项]          安装/更新 Realm 并配置 OpenRC
   alpine.sh realm add [选项]              添加一条转发规则
-  alpine.sh realm delete <ID>             删除一条转发规则
+  alpine.sh realm edit <ID> [选项]        编辑一条转发规则
+  alpine.sh realm delete <ID>             删除一条转发规则（剩余规则重新编号）
   alpine.sh realm protocol <tcp|udp|both> 设置全部规则使用的协议
   alpine.sh realm list                    列出规则
   alpine.sh realm status                  查看版本、规则和服务状态
@@ -46,12 +47,14 @@ Realm 端口转发管理（Alpine / OpenRC）
   alpine.sh realm update [--version TAG]  更新 Realm（默认最新版）
   alpine.sh realm uninstall [--purge]     卸载服务；默认保留配置
 
-install 选项：
+install / add / edit 选项：
   --listen <PORT|IP:PORT>          本机监听端口或地址
   --remote <HOST:PORT>             目标地址（IPv6 请写成 [::1]:443）
-  --protocol <tcp|udp|both>        全局协议，默认 both
+  --protocol <tcp|udp|both>        全局协议，默认 both（仅 install）
   --version <TAG>                  安装指定版本，例如 v2.9.4
   --force                          备份并接管非本脚本管理的旧配置/服务
+
+添加或删除规则后，ID 会按当前顺序重新编号为 1..N。
 
 环境变量：
   REALM_TARGET                     覆盖自动检测的发布目标，例如
@@ -146,6 +149,35 @@ next_route_id() {
     awk -F '\t' '!/^#/ && $1 ~ /^[0-9]+$/ && $1 > max { max = $1 } END { print max + 1 }' "$state_file"
 }
 
+# Rewrite IDs as 1..N in file order so add/delete never leave gaps.
+compact_routes() {
+    local state_file="$1"
+    local tmp
+    tmp="${state_file}.compact.$$"
+    {
+        printf '# id\tlisten\tremote\n'
+        awk -F '\t' 'BEGIN { OFS = FS }
+            !/^#/ && NF >= 3 { n++; print n, $2, $3 }
+        ' "$state_file"
+    } >"$tmp" || { rm -f -- "$tmp"; return 1; }
+    cat "$tmp" >"$state_file" || { rm -f -- "$tmp"; return 1; }
+    rm -f -- "$tmp"
+}
+
+read_route() {
+    local state_file="$1"
+    local id="$2"
+    local line=""
+    ROUTE_LISTEN=""
+    ROUTE_REMOTE=""
+    line="$(awk -F '\t' -v id="$id" '
+        !/^#/ && $1 == id { print $2 "\t" $3; found = 1; exit }
+        END { exit !found }
+    ' "$state_file")" || return 1
+    ROUTE_LISTEN="${line%%$'\t'*}"
+    ROUTE_REMOTE="${line#*$'\t'}"
+}
+
 validate_state_file() {
     local state_file="$1"
     local id listen remote extra
@@ -177,6 +209,68 @@ append_route_to_state() {
 
     id="$(next_route_id "$state_file")"
     printf '%s\t%s\t%s\n' "$id" "$listen" "$remote" >>"$state_file"
+    compact_routes "$state_file" || return 1
+    route_count "$state_file"
+}
+
+delete_route_from_state() {
+    local state_file="$1"
+    local id="$2"
+    local tmp
+    local awk_status=0
+
+    tmp="${state_file}.del.$$"
+    awk -F '\t' -v id="$id" 'BEGIN { OFS = FS }
+        /^#/ || NF == 0 { print; next }
+        $1 == id { found = 1; next }
+        { print }
+        END { if (!found) exit 2 }
+    ' "$state_file" >"$tmp" || awk_status=$?
+    if [[ "$awk_status" -ne 0 ]]; then
+        rm -f -- "$tmp"
+        return 1
+    fi
+    cat "$tmp" >"$state_file" || { rm -f -- "$tmp"; return 1; }
+    rm -f -- "$tmp"
+    compact_routes "$state_file"
+}
+
+update_route_in_state() {
+    local state_file="$1"
+    local id="$2"
+    local listen_input="$3"
+    local remote_input="$4"
+    local listen="" remote="" tmp
+
+    read_route "$state_file" "$id" || { error "未找到规则 ID：$id"; return 1; }
+
+    if [[ -n "$listen_input" ]]; then
+        listen="$(normalize_listen "$listen_input")" || return 1
+    else
+        listen="$ROUTE_LISTEN"
+    fi
+    if [[ -n "$remote_input" ]]; then
+        validate_remote_endpoint "$remote_input" || return 1
+        remote="$remote_input"
+    else
+        remote="$ROUTE_REMOTE"
+    fi
+
+    if awk -F '\t' -v id="$id" -v listen="$listen" -v remote="$remote" \
+        '!/^#/ && $1 != id && $2 == listen && $3 == remote { found = 1 } END { exit !found }' "$state_file"; then
+        error "相同规则已存在：$listen -> $remote"
+        return 1
+    fi
+
+    tmp="${state_file}.edit.$$"
+    awk -F '\t' -v id="$id" -v listen="$listen" -v remote="$remote" 'BEGIN { OFS = FS }
+        /^#/ || NF == 0 { print; next }
+        $1 == id { print id, listen, remote; found = 1; next }
+        { print }
+        END { if (!found) exit 2 }
+    ' "$state_file" >"$tmp" || { rm -f -- "$tmp"; return 1; }
+    cat "$tmp" >"$state_file" || { rm -f -- "$tmp"; return 1; }
+    rm -f -- "$tmp"
     printf '%s\n' "$id"
 }
 
@@ -198,7 +292,7 @@ render_config() {
 
     {
         printf '%s\n' "$REALM_MANAGED_MARKER"
-        printf '%s\n\n' "# Use alpine.sh realm to add or delete routes; manual changes may be overwritten."
+        printf '%s\n\n' "# Use alpine.sh realm to add, edit or delete routes; manual changes may be overwritten."
         printf '[log]\nlevel = "warn"\noutput = "stdout"\n\n'
         printf '[network]\nno_tcp = %s\nuse_udp = %s\n\n' "$no_tcp" "$use_udp"
         while IFS=$'\t' read -r id listen remote extra || [[ -n "${id:-}" ]]; do
@@ -664,8 +758,61 @@ add_command() {
     list_command
 }
 
+edit_command() {
+    local id="" listen="" remote="" tmp_dir candidate current_listen current_remote
+    while (($#)); do
+        case "$1" in
+            --listen) (($# >= 2)) || die "--listen 缺少参数。"; listen="$2"; shift 2 ;;
+            --remote) (($# >= 2)) || die "--remote 缺少参数。"; remote="$2"; shift 2 ;;
+            -h|--help) realm_usage; return 0 ;;
+            *)
+                if [[ "$1" =~ ^[0-9]+$ && -z "$id" ]]; then
+                    id="$1"
+                    shift
+                else
+                    die "未知 edit 参数：$1"
+                fi
+                ;;
+        esac
+    done
+    realm_prepare
+    ensure_managed_install
+
+    if [[ -z "$id" ]]; then
+        list_command
+        prompt_value id "要编辑的规则 ID" ""
+    fi
+    [[ "$id" =~ ^[0-9]+$ ]] || { error "请提供要编辑的数字 ID。"; return 1; }
+    read_route "$REALM_STATE" "$id" || die "未找到规则 ID：$id"
+    current_listen="$ROUTE_LISTEN"
+    current_remote="$ROUTE_REMOTE"
+
+    if [[ -z "$listen" ]]; then
+        if can_prompt; then
+            prompt_value listen "本机监听端口或地址" "$current_listen"
+        fi
+    fi
+    if [[ -z "$remote" ]]; then
+        if can_prompt; then
+            prompt_value remote "目标地址（HOST:PORT）" "$current_remote"
+        fi
+    fi
+    if [[ -z "$listen" && -z "$remote" ]]; then
+        die "请指定 --listen 和/或 --remote。"
+    fi
+
+    realm_temp_dir
+    tmp_dir="$LAST_TEMP_DIR"
+    candidate="$tmp_dir/routes.tsv"
+    cp "$REALM_STATE" "$candidate"
+    update_route_in_state "$candidate" "$id" "$listen" "$remote" >/dev/null || return 1
+    apply_configuration "$candidate" "$(read_protocol)" || die "编辑失败；原配置已恢复。"
+    info "已更新规则 ID ${id}。"
+    list_command
+}
+
 delete_command() {
-    local id="${1:-}" tmp_dir candidate awk_status=0
+    local id="${1:-}" tmp_dir candidate
     realm_prepare
     ensure_managed_install
     [[ "$id" =~ ^[0-9]+$ ]] || { error "请提供要删除的数字 ID。"; return 1; }
@@ -673,17 +820,12 @@ delete_command() {
     realm_temp_dir
     tmp_dir="$LAST_TEMP_DIR"
     candidate="$tmp_dir/routes.tsv"
-    awk -F '\t' -v id="$id" 'BEGIN { OFS = FS }
-        /^#/ || NF == 0 { print; next }
-        $1 == id { found = 1; next }
-        { print }
-        END { if (!found) exit 2 }
-    ' "$REALM_STATE" >"$candidate" || awk_status=$?
-    [[ "$awk_status" -eq 0 ]] || die "未找到规则 ID：$id"
+    cp "$REALM_STATE" "$candidate"
+    delete_route_from_state "$candidate" "$id" || die "未找到规则 ID：$id"
     (($(route_count "$candidate") > 0)) || die "不能删除最后一条规则；如需停用请执行 uninstall。"
 
     apply_configuration "$candidate" "$(read_protocol)" || die "删除失败；原配置已恢复。"
-    info "已删除规则 ID ${id}。"
+    info "已删除原规则 ID ${id}，剩余规则已重新编号。"
     list_command
 }
 
@@ -798,12 +940,13 @@ realm_menu() {
 ────────────────────────────────────────
   1) 安装/修复 Realm
   2) 添加转发规则
-  3) 删除转发规则
-  4) 查看规则与状态
-  5) 修改全局协议
-  6) 更新 Realm
-  7) 查看日志
-  8) 卸载（保留配置）
+  3) 编辑转发规则
+  4) 删除转发规则
+  5) 查看规则与状态
+  6) 修改全局协议
+  7) 更新 Realm
+  8) 查看日志
+  9) 卸载（保留配置）
   0) 返回主菜单
 ────────────────────────────────────────
 EOF
@@ -811,17 +954,18 @@ EOF
         case "$choice" in
             1) install_command; pause ;;
             2) add_command; pause ;;
-            3)
+            3) edit_command; pause ;;
+            4)
                 list_command
                 ask choice "请输入要删除的规则 ID: "
                 delete_command "$choice"
                 pause
                 ;;
-            4) status_command; pause ;;
-            5) protocol_command; pause ;;
-            6) update_command; pause ;;
-            7) logs_command; pause ;;
-            8) uninstall_command; pause ;;
+            5) status_command; pause ;;
+            6) protocol_command; pause ;;
+            7) update_command; pause ;;
+            8) logs_command; pause ;;
+            9) uninstall_command; pause ;;
             0|q|Q) return 0 ;;
             *) warn "无效选择"; sleep 1 ;;
         esac
@@ -835,6 +979,7 @@ realm_main() {
         menu) realm_menu "$@" ;;
         install) install_command "$@" ;;
         add) add_command "$@" ;;
+        edit) edit_command "$@" ;;
         delete|remove|rm) delete_command "$@" ;;
         protocol) protocol_command "$@" ;;
         list|ls) list_command "$@" ;;

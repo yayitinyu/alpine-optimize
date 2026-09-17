@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Alpine sing-box: VLESS Reality + AnyTLS, optional WARP, custom routes.
+# Alpine sing-box: VLESS Reality inbound, custom routes.
 # Adapted from sing-box-plus for OpenRC / musl.
 
 if [[ -z "${ALPINE_OPTIMIZE_COMMON:-}" ]]; then
@@ -7,18 +7,15 @@ if [[ -z "${ALPINE_OPTIMIZE_COMMON:-}" ]]; then
     . "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/lib/common.sh"
 fi
 
-SB_VERSION_LABEL="1.1.0"
+SB_VERSION_LABEL="1.2.0"
 SB_GITHUB_REPO="SagerNet/sing-box"
 SB_DIR="${SB_DIR:-/opt/alpine-sing-box}"
 SB_BIN="${SB_BIN:-/usr/local/bin/sing-box}"
 SB_CONF="${SB_CONF:-${SB_DIR}/config.json}"
 SB_STATE="${SB_STATE:-${SB_DIR}/state.env}"
 SB_LINKS="${SB_LINKS:-${SB_DIR}/share-links.txt}"
-SB_CERT_DIR="${SB_CERT_DIR:-${SB_DIR}/cert}"
 SB_DATA_DIR="${SB_DATA_DIR:-${SB_DIR}/data}"
 SB_ROUTE_JSON="${SB_ROUTE_JSON:-${SB_DIR}/routes.json}"
-SB_WARP_ENV="${SB_WARP_ENV:-${SB_DIR}/warp.env}"
-WGCF_BIN="${WGCF_BIN:-/usr/local/bin/wgcf}"
 SB_SERVICE="${SB_SERVICE:-alpine-sing-box}"
 SB_INIT="/etc/init.d/${SB_SERVICE}"
 SB_LOG="${SB_LOG:-/var/log/alpine-sing-box.log}"
@@ -30,29 +27,15 @@ SB_SNI="${SB_SNI:-www.tokyometro.jp}"
 SB_TAG="${SB_TAG:-latest}"
 SB_ALLOW_PRIVATE="${SB_ALLOW_PRIVATE:-0}"
 SB_LISTEN="${SB_LISTEN:-}"
-ENABLE_WARP="${ENABLE_WARP:-true}"
-WARP_KEEPALIVE_INTERVAL="${WARP_KEEPALIVE_INTERVAL:-25}"
-
-# NAT boxes usually only get a handful of forwarded ports, so the default
-# 4-inbound layout is unusable there. "single" runs one inbound on one port.
-SB_MODE="${SB_MODE:-full}"
-SB_SINGLE_PROTO="${SB_SINGLE_PROTO:-vless}"
-SB_SINGLE_PORT="${SB_SINGLE_PORT:-}"
-SB_SINGLE_WARP="${SB_SINGLE_WARP:-0}"
+PORT_VLESS="${PORT_VLESS:-}"
 
 CLI_FORCE=0
-CLI_SINGLE=0
-CLI_SINGLE_PROTO=""
-CLI_SINGLE_PORT=""
-CLI_SINGLE_WARP=""
+CLI_PORT=""
 SB_DID_MIGRATE=0
 STATE_VERSION=""
 SBP_PARSED_HOST=""
 SBP_PARSED_PORT=""
 SBP_SELECTED_OUTBOUND=""
-SBP_SINGLE_PROTO=""
-SBP_SINGLE_PORT=""
-SBP_SINGLE_WARP=0
 
 default_listen_address() {
     if [[ -n "$SB_LISTEN" ]]; then
@@ -71,14 +54,13 @@ singbox_usage() {
     cat <<'EOF'
 Alpine sing-box（OpenRC）
 
-入站：VLESS Reality + AnyTLS，各一条直连、一条 WARP。
-NAT 机型可用单节点模式：只开一个入站，端口自选。
-支持自定义分流，以及导入 socks5h / 分享链接作为远程出口。
+入站：一条 VLESS Reality。支持自定义分流，以及导入
+socks5h / 分享链接作为远程出口。NAT 机型可用 --port 指定映射端口。
 
 用法：
   alpine.sh sing-box                  交互菜单（停留在子菜单）
   alpine.sh sing-box install [选项]
-  alpine.sh sing-box single           交互式单节点（指定端口，NAT）
+  alpine.sh sing-box single           交互式指定端口（NAT）
   alpine.sh sing-box links
   alpine.sh sing-box status
   alpine.sh sing-box restart
@@ -89,17 +71,14 @@ NAT 机型可用单节点模式：只开一个入站，端口自选。
 
 install 选项：
   -H, --host HOST          客户端连接地址（IPv4 或域名）
-      --sni HOST           Reality / AnyTLS SNI，默认 www.tokyometro.jp
+      --sni HOST           Reality SNI，默认 www.tokyometro.jp
       --version TAG        指定 sing-box 版本
       --allow-private      允许代理访问内网地址
-      --no-warp            不注册 WARP
-      --single PROTO       单节点模式：vless 或 anytls（NAT 机型）
-  -p, --port PORT          单节点监听端口，留空随机；隐含 --single
-      --single-warp        单节点出口走 WARP
+  -p, --port PORT          监听端口，留空随机
   -f, --force              覆盖已有安装
 
-已安装时再次执行 install 并带上 --single / --port，会就地切换为
-单节点并保留原有 UUID、Reality 密钥与 AnyTLS 密码。
+已安装时再次执行 install 并带上 --port，会就地改端口并保留
+原有 UUID 与 Reality 密钥。
 EOF
 }
 
@@ -153,17 +132,6 @@ split_hostport() {
     [[ "$SBP_PARSED_PORT" =~ ^[0-9]+$ ]]
 }
 
-pad_b64() {
-    local s="${1:-}"
-    s="$(printf '%s' "$s" | tr -d '\r\n\" ')"
-    s="${s%%=*}"
-    local rem=$(( ${#s} % 4 ))
-    if ((rem == 2)); then s="${s}=="
-    elif ((rem == 3)); then s="${s}="
-    fi
-    printf '%s' "$s"
-}
-
 urlencode() {
     local raw="$1"
     local i c out=""
@@ -186,66 +154,10 @@ generate_uuid() {
     fi
 }
 
-choose_unique_ports() {
-    local count="$1"
-    local -a used=()
-    local port i j dup existing
-    for ((i = 0; i < count; i++)); do
-        dup=1
-        for ((j = 0; j < 64 && dup == 1; j++)); do
-            port="$(choose_random_port)" || die "无法分配空闲端口。"
-            dup=0
-            for existing in "${used[@]:-}"; do
-                [[ "$existing" == "$port" ]] && dup=1
-            done
-        done
-        ((dup == 0)) || die "无法分配不重复端口。"
-        used+=("$port")
-    done
-    printf '%s\n' "${used[*]}"
-}
-
-normalize_single_proto() {
-    case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
-        vless|reality|vless-reality) printf 'vless\n' ;;
-        anytls|anytls-tls) printf 'anytls\n' ;;
-        *) return 1 ;;
-    esac
-}
-
-# Single source of truth for "which inbounds exist": {proto, tag, port, warp}.
-# render_singbox_config and write_share_links both consume it.
+# Single source of truth for the inbound: {proto, tag, port}.
 node_plan_json() {
-    local warp="false"
-    warp_ready && warp="true"
-
-    if [[ "${SB_MODE:-full}" == "single" ]]; then
-        local single_warp="false"
-        if [[ "${SB_SINGLE_WARP:-0}" == "1" && "$warp" == "true" ]]; then
-            single_warp="true"
-        fi
-        jq -n -c \
-            --arg proto "${SB_SINGLE_PROTO:-vless}" \
-            --argjson port "${SB_SINGLE_PORT:-0}" \
-            --argjson warp "$single_warp" '
-            [{proto: $proto,
-              tag: ((if $proto == "anytls" then "anytls" else "vless-reality" end)
-                    + (if $warp then "-warp" else "" end)),
-              port: $port,
-              warp: $warp}]'
-        return
-    fi
-
-    jq -n -c \
-        --argjson pv "${PORT_VLESS:-0}" --argjson pa "${PORT_ANYTLS:-0}" \
-        --argjson pvw "${PORT_VLESS_W:-0}" --argjson paw "${PORT_ANYTLS_W:-0}" \
-        --argjson warp "$warp" '
-        [{proto:"vless",  tag:"vless-reality", port:$pv, warp:false},
-         {proto:"anytls", tag:"anytls",        port:$pa, warp:false}]
-        + (if $warp then
-             [{proto:"vless",  tag:"vless-reality-warp", port:$pvw, warp:true},
-              {proto:"anytls", tag:"anytls-warp",        port:$paw, warp:true}]
-           else [] end)'
+    jq -n -c --argjson port "${PORT_VLESS:-0}" \
+        '[{proto:"vless", tag:"vless-reality", port:$port}]'
 }
 
 parse_reality_keypair() {
@@ -384,156 +296,6 @@ ensure_singbox_binary() {
     fi
 }
 
-install_wgcf() {
-    [[ -x "$WGCF_BIN" ]] && singbox_probe "$WGCF_BIN" && return 0
-    local goarch url tmp json
-    goarch="$(detect_goarch)"
-    json="$(curl -fsSL --retry 3 --connect-timeout 15 \
-        -H 'Accept: application/vnd.github+json' \
-        -H 'User-Agent: alpine-optimize-sing-box' \
-        "https://api.github.com/repos/ViRb3/wgcf/releases/latest")" || return 1
-    url="$(printf '%s' "$json" | jq -r --arg a "$goarch" '
-        .assets[]? | select(.name | test("linux[_-]" + $a + "$")) | .browser_download_url
-    ' | head -n1)"
-    [[ -n "$url" && "$url" != "null" ]] || return 1
-    tmp="$(new_temp_dir)"
-    info "下载 wgcf ..."
-    curl -fsSL --retry 3 --connect-timeout 15 -o "${tmp}/wgcf" "$url" || return 1
-    chmod +x "${tmp}/wgcf"
-    if ! "${tmp}/wgcf" --help >/dev/null 2>&1; then
-        warn "wgcf 二进制无法在 musl 上运行。"
-        return 1
-    fi
-    install -m 0755 "${tmp}/wgcf" "$WGCF_BIN"
-}
-
-parse_warp_client_id() {
-    local toml_file="$1" cid bytes r1 r2 r3
-    [[ -f "$toml_file" ]] || return 1
-    cid="$(awk -F'=' '/^[[:space:]]*client_id/{v=$2; gsub(/["'\''\r[:space:]]/,"",v); print v; exit}' "$toml_file" 2>/dev/null || true)"
-    [[ -n "$cid" ]] || return 1
-    bytes="$(printf '%s' "$cid" | openssl base64 -d -A 2>/dev/null | od -An -tuC 2>/dev/null || true)"
-    if [[ -z "$bytes" ]]; then
-        bytes="$(printf '%s' "$cid" | base64 -d 2>/dev/null | od -An -tuC 2>/dev/null || true)"
-    fi
-    IFS=' ' read -r r1 r2 r3 <<< "$bytes"
-    if [[ -n "${r1:-}" && -n "${r2:-}" && -n "${r3:-}" ]]; then
-        printf '%s %s %s\n' "$r1" "$r2" "$r3"
-        return 0
-    fi
-    return 1
-}
-
-ensure_warp_profile() {
-    [[ "${ENABLE_WARP}" == "true" ]] || return 1
-    if [[ -f "$SB_WARP_ENV" ]]; then
-        # shellcheck disable=SC1090
-        source "$SB_WARP_ENV"
-        WARP_PRIVATE_KEY="$(pad_b64 "${WARP_PRIVATE_KEY:-}")"
-        WARP_PEER_PUBLIC_KEY="$(pad_b64 "${WARP_PEER_PUBLIC_KEY:-}")"
-        : "${WARP_RESERVED_1:=0}" "${WARP_RESERVED_2:=0}" "${WARP_RESERVED_3:=0}"
-        if [[ -n "$WARP_PRIVATE_KEY" && -n "$WARP_PEER_PUBLIC_KEY" \
-            && -n "${WARP_ENDPOINT_HOST:-}" && -n "${WARP_ENDPOINT_PORT:-}" ]]; then
-            # If reserved bytes are all 0, try to recover from client_id
-            if [[ "$WARP_RESERVED_1" == "0" && "$WARP_RESERVED_2" == "0" && "$WARP_RESERVED_3" == "0" ]]; then
-                local cid_res
-                if cid_res="$(parse_warp_client_id "${SB_DIR}/wgcf/wgcf-account.toml")"; then
-                    IFS=' ' read -r WARP_RESERVED_1 WARP_RESERVED_2 WARP_RESERVED_3 <<< "$cid_res"
-                fi
-            fi
-            save_warp_env
-            return 0
-        fi
-    fi
-
-    install_wgcf || { warn "wgcf 安装失败，已禁用 WARP 节点。"; ENABLE_WARP=false; return 1; }
-
-    local wd="${SB_DIR}/wgcf" prof ep host port ad rs addr
-    mkdir -p "$wd"
-    if [[ ! -f "$wd/wgcf-account.toml" ]]; then
-        info "正在注册 WARP 账户..."
-        if ! "$WGCF_BIN" register --accept-tos --config "$wd/wgcf-account.toml" >/dev/null; then
-            warn "WARP 注册失败，已禁用 WARP 节点。"
-            ENABLE_WARP=false
-            return 1
-        fi
-    fi
-    if ! "$WGCF_BIN" generate --config "$wd/wgcf-account.toml" --profile "$wd/wgcf-profile.conf" >/dev/null; then
-        warn "WARP 配置生成失败，已禁用 WARP 节点。"
-        ENABLE_WARP=false
-        return 1
-    fi
-
-    prof="$wd/wgcf-profile.conf"
-    WARP_PRIVATE_KEY="$(pad_b64 "$(awk -F'= *' '/^PrivateKey/{gsub(/\r/,"");print $2; exit}' "$prof")")"
-    WARP_PEER_PUBLIC_KEY="$(pad_b64 "$(awk -F'= *' '/^PublicKey/{gsub(/\r/,"");print $2; exit}' "$prof")")"
-    ep="$(awk -F'= *' '/^Endpoint/{gsub(/\r/,"");print $2; exit}' "$prof" | tr -d '" ')"
-    if [[ "$ep" =~ ^\[(.+)\]:(.+)$ ]]; then
-        host="${BASH_REMATCH[1]}"; port="${BASH_REMATCH[2]}"
-    else
-        host="${ep%:*}"; port="${ep##*:}"
-    fi
-    WARP_ENDPOINT_HOST="$host"
-    WARP_ENDPOINT_PORT="$port"
-
-    ad="$(awk -F'= *' '/^Address/{gsub(/\r/,"");print $2; exit}' "$prof" | tr -d '"')"
-    WARP_ADDRESS_V4=""
-    WARP_ADDRESS_V6=""
-    IFS=',' read -r -a addr_list <<< "$ad"
-    for addr in "${addr_list[@]:-}"; do
-        addr="$(echo "$addr" | tr -d '[:space:]')"
-        if [[ "$addr" == *.* && "$addr" == */* ]]; then
-            WARP_ADDRESS_V4="$addr"
-        elif [[ "$addr" == *:* && "$addr" == */* ]]; then
-            WARP_ADDRESS_V6="$addr"
-        fi
-    done
-
-    # 1. Try to read reserved from profile.conf
-    rs="$(awk -F'= *' '/^Reserved/{gsub(/\r/,"");print $2; exit}' "$prof" 2>/dev/null | tr -d '" ')"
-    if [[ -n "$rs" ]]; then
-        WARP_RESERVED_1="${rs%%,*}"; rs="${rs#*,}"
-        WARP_RESERVED_2="${rs%%,*}"; WARP_RESERVED_3="${rs##*,}"
-    fi
-
-    # 2. Decode client_id from wgcf-account.toml (essential for Cloudflare WARP on WireGuard)
-    local cid_res
-    if cid_res="$(parse_warp_client_id "$wd/wgcf-account.toml")"; then
-        IFS=' ' read -r WARP_RESERVED_1 WARP_RESERVED_2 WARP_RESERVED_3 <<< "$cid_res"
-    fi
-    : "${WARP_RESERVED_1:=0}" "${WARP_RESERVED_2:=0}" "${WARP_RESERVED_3:=0}"
-
-    if [[ -z "$WARP_PRIVATE_KEY" || -z "$WARP_PEER_PUBLIC_KEY" || -z "$WARP_ENDPOINT_HOST" ]]; then
-        warn "WARP 配置不完整，已禁用 WARP 节点。"
-        ENABLE_WARP=false
-        return 1
-    fi
-    save_warp_env
-    ok "WARP 配置已就绪。"
-}
-
-save_warp_env() {
-    write_file "$SB_WARP_ENV" 0600 <<EOF
-WARP_PRIVATE_KEY=$(printf '%q' "${WARP_PRIVATE_KEY:-}")
-WARP_PEER_PUBLIC_KEY=$(printf '%q' "${WARP_PEER_PUBLIC_KEY:-}")
-WARP_ENDPOINT_HOST=$(printf '%q' "${WARP_ENDPOINT_HOST:-}")
-WARP_ENDPOINT_PORT=$(printf '%q' "${WARP_ENDPOINT_PORT:-}")
-WARP_ADDRESS_V4=$(printf '%q' "${WARP_ADDRESS_V4:-}")
-WARP_ADDRESS_V6=$(printf '%q' "${WARP_ADDRESS_V6:-}")
-WARP_RESERVED_1=$(printf '%q' "${WARP_RESERVED_1:-0}")
-WARP_RESERVED_2=$(printf '%q' "${WARP_RESERVED_2:-0}")
-WARP_RESERVED_3=$(printf '%q' "${WARP_RESERVED_3:-0}")
-EOF
-}
-
-warp_ready() {
-    [[ "${ENABLE_WARP}" == "true" \
-        && -n "${WARP_PRIVATE_KEY:-}" \
-        && -n "${WARP_PEER_PUBLIC_KEY:-}" \
-        && -n "${WARP_ENDPOINT_HOST:-}" \
-        && -n "${WARP_ENDPOINT_PORT:-}" ]]
-}
-
 empty_route_json() { printf '%s\n' '{"rules":[],"rule_set":[],"outbounds":[]}'; }
 
 ensure_route_file() {
@@ -546,7 +308,17 @@ ensure_route_file() {
         mv "$SB_ROUTE_JSON" "${SB_ROUTE_JSON}.bad.$(date +%Y%m%d-%H%M%S)"
         warn "自定义路由文件无效，已重建。"
         empty_route_json >"$SB_ROUTE_JSON"
+        return 0
     fi
+    local tmp
+    tmp="$(mktemp)"
+    # Drop leftover warp rules from older installs.
+    jq -c '
+        .rules = ((.rules // []) | map(select((.outbound // "") != "warp")))
+        | .rule_set = (.rule_set // [])
+        | .outbounds = ((.outbounds // []) | map(select((.tag // "") != "warp")))
+    ' "$SB_ROUTE_JSON" >"$tmp" || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$SB_ROUTE_JSON"
 }
 
 load_route_json() {
@@ -650,7 +422,7 @@ share_link_to_outbound() {
             sid="$(query_get "$query" sid)"
             jq -n -c \
                 --arg tag "$tag" --arg server "$server" --argjson port "$port" --arg uuid "$uuid" \
-                --arg flow "$flow" --arg security "$security" --arg sni "$sni" --arg fp "${fp:-chrome}" \
+                --arg flow "$flow" --arg security "$security" --arg sni "$sni" --arg fp "${fp:-ios}" \
                 --arg pbk "$pbk" --arg sid "$sid" '
                 {type:"vless", tag:$tag, server:$server, server_port:$port, uuid:$uuid, domain_resolver:"dns-doh-primary"}
                 | if $flow != "" then .flow = $flow else . end
@@ -730,33 +502,11 @@ share_link_to_outbound() {
     esac
 }
 
-ensure_self_signed_cert() {
-    local force="${1:-0}"
-    mkdir -p "$SB_CERT_DIR"
-    local key="${SB_CERT_DIR}/key.pem"
-    local crt="${SB_CERT_DIR}/cert.pem"
-    local cn=""
-    if [[ -f "$crt" ]]; then
-        cn="$(openssl x509 -noout -subject -in "$crt" 2>/dev/null | sed -n 's/.*CN[[:space:]]*=[[:space:]]*//p')"
-    fi
-    if [[ "$force" != "1" && -f "$key" && -f "$crt" && "$cn" == "$SB_SNI" ]]; then
-        return 0
-    fi
-    openssl ecparam -genkey -name prime256v1 -out "$key" >/dev/null 2>&1
-    openssl req -new -x509 -days 3650 -key "$key" -out "$crt" \
-        -subj "/CN=${SB_SNI}" >/dev/null 2>&1 \
-        || die "生成自签证书失败。"
-    chmod 600 "$key"
-    chmod 644 "$crt"
-}
-
 render_singbox_config() {
     local listen routes nodes
     listen="$(default_listen_address)"
     routes="$(load_route_json)"
     nodes="$(node_plan_json)"
-    local warp="false"
-    warp_ready && warp="true"
 
     local dns_strategy="prefer_ipv4"
     if [[ -z "$(default_ipv4_address || true)" && -n "$(default_ipv6_address || true)" ]]; then
@@ -767,16 +517,9 @@ render_singbox_config() {
     # reset by some NAT egress paths even though IP-based TLS verification works.
     jq -n \
         --arg LOG "$SB_LOG" --arg LISTEN "$listen" --arg SNI "$SB_SNI" \
-        --arg CRT "${SB_CERT_DIR}/cert.pem" --arg KEY "${SB_CERT_DIR}/key.pem" \
         --arg UUID "$UUID" --arg RPRIV "$REALITY_PRIV" --arg RSID "$REALITY_SID" \
-        --arg ANYTLS "$ANYTLS_PWD" \
         --argjson NODES "$nodes" \
-        --argjson WARP "$warp" --argjson PRIV "$SB_ALLOW_PRIVATE" \
-        --arg WPRIV "${WARP_PRIVATE_KEY:-}" --arg WPPUB "${WARP_PEER_PUBLIC_KEY:-}" \
-        --arg WHOST "${WARP_ENDPOINT_HOST:-}" --argjson WPORT "${WARP_ENDPOINT_PORT:-0}" \
-        --arg W4 "${WARP_ADDRESS_V4:-}" --arg W6 "${WARP_ADDRESS_V6:-}" \
-        --argjson WR1 "${WARP_RESERVED_1:-0}" --argjson WR2 "${WARP_RESERVED_2:-0}" --argjson WR3 "${WARP_RESERVED_3:-0}" \
-        --argjson WKA "${WARP_KEEPALIVE_INTERVAL:-25}" \
+        --argjson PRIV "$SB_ALLOW_PRIVATE" \
         --argjson CUSTOM "$routes" \
         --arg STRATEGY "$dns_strategy" \
         --arg BIND4 "$(default_ipv4_address || true)" --arg BIND6 "$(default_ipv6_address || true)" '
@@ -786,11 +529,6 @@ render_singbox_config() {
            tls:{enabled:true, server_name:$SNI,
                 reality:{enabled:true, handshake:{server:$SNI, server_port:443},
                          private_key:$RPRIV, short_id:[$RSID]}}};
-        def inbound_anytls($port; $tag):
-          {type:"anytls", tag:$tag, listen:$LISTEN, listen_port:$port,
-           users:[{name:"anytls", password:$ANYTLS}],
-           tls:{enabled:true, server_name:$SNI, alpn:["h2","http/1.1"],
-                certificate_path:$CRT, key_path:$KEY}};
         def custom_rule($rule):
           ({}
             + (if (($rule.domain // [])|length)>0 then {domain:$rule.domain} else {} end)
@@ -801,7 +539,6 @@ render_singbox_config() {
             + {action:"route", outbound:$rule.outbound});
         def uses($tag):
           ((($CUSTOM.rules // []) | map(select((.outbound // "") == $tag)) | length) > 0);
-        ($NODES | map(select(.warp)) | map(.tag)) as $WARP_TAGS |
         {
           log:{level:"warn", timestamp:true, output:$LOG},
           dns:{
@@ -817,22 +554,7 @@ render_singbox_config() {
             final:"dns-doh-primary",
             strategy:$STRATEGY
           },
-          endpoints: (if $WARP and ((($WARP_TAGS | length) > 0) or uses("warp")) then [{
-            type:"wireguard", tag:"warp", system:false,
-            address: ([ $W4, $W6 ] | map(select(. != ""))),
-            private_key:$WPRIV,
-            peers:[{address:$WHOST, port:$WPORT, public_key:$WPPUB,
-                    reserved:[$WR1,$WR2,$WR3],
-                    allowed_ips:["0.0.0.0/0","::/0"],
-                    persistent_keepalive_interval:$WKA}],
-            mtu:1280,
-            domain_resolver:"dns-doh-primary"
-          }] else [] end),
-          inbounds: (
-            $NODES | map(
-              if .proto == "anytls" then inbound_anytls(.port; .tag)
-              else inbound_vless(.port; .tag) end)
-          ),
+          inbounds: ($NODES | map(inbound_vless(.port; .tag))),
           outbounds: (
             [{type:"direct", tag:"direct", domain_resolver:"dns-doh-primary"}]
             + (if uses("direct-ipv4") then
@@ -854,7 +576,6 @@ render_singbox_config() {
               rules: (
                 [{action:"sniff"}]
                 + (($CUSTOM.rules // []) | map(select((.outbound // "") != "")) | map(custom_rule(.)))
-                + (if ($WARP_TAGS | length) > 0 then [{inbound:$WARP_TAGS, action:"route", outbound:"warp"}] else [] end)
                 + (if $PRIV == 0 then [{ip_is_private:true, action:"reject"}] else [] end)
               )
             }
@@ -865,58 +586,31 @@ render_singbox_config() {
 
 vless_share_link() {
     local host="$1" port="$2" uuid="$3" sni="$4" pbk="$5" sid="$6" name="${7:-vless-reality}"
-    printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=chrome&pbk=%s&sid=%s&type=tcp#%s\n' \
+    printf 'vless://%s@%s:%s?encryption=none&flow=xtls-rprx-vision&security=reality&sni=%s&fp=ios&pbk=%s&sid=%s&type=tcp#%s\n' \
         "$uuid" "$host" "$port" "$(urlencode "$sni")" "$pbk" "$sid" "$(urlencode "$name")"
-}
-
-anytls_share_link() {
-    local host="$1" port="$2" password="$3" sni="$4" name="${5:-anytls}"
-    printf 'anytls://%s@%s:%s?insecure=1&sni=%s&alpn=h2,http/1.1&fp=chrome#%s\n' \
-        "$(urlencode "$password")" "$host" "$port" "$(urlencode "$sni")" "$(urlencode "$name")"
 }
 
 write_share_links() {
     local host="${SB_HOST}"
     [[ -n "$host" ]] || host="$(discover_public_ipv4)"
-    local proto tag port warp group last_group=""
     {
-        while IFS=$'\t' read -r proto tag port warp; do
-            [[ -n "$proto" ]] || continue
-            warp="${warp%$'\r'}"
-            if [[ "$warp" == "true" ]]; then group="# WARP"; else group="# 直连"; fi
-            if [[ "$group" != "$last_group" ]]; then
-                printf '%s\n' "$group"
-                last_group="$group"
-            fi
-            case "$proto" in
-                anytls) anytls_share_link "$host" "$port" "$ANYTLS_PWD" "$SB_SNI" "$tag" ;;
-                *) vless_share_link "$host" "$port" "$UUID" "$SB_SNI" "$REALITY_PUB" "$REALITY_SID" "$tag" ;;
-            esac
-        done < <(node_plan_json | jq -r '.[] | [.proto, .tag, (.port | tostring), (.warp | tostring)] | @tsv')
+        printf '%s\n' "# VLESS Reality"
+        vless_share_link "$host" "${PORT_VLESS}" "$UUID" "$SB_SNI" "$REALITY_PUB" "$REALITY_SID" "vless-reality"
     } >"$SB_LINKS"
     chmod 600 "$SB_LINKS"
 }
 
 write_sb_state() {
     write_file "$SB_STATE" 0600 <<EOF
-STATE_VERSION=3
+STATE_VERSION=4
 SB_HOST=$(printf '%q' "$SB_HOST")
 SB_SNI=$(printf '%q' "$SB_SNI")
 UUID=$(printf '%q' "$UUID")
 REALITY_PRIV=$(printf '%q' "$REALITY_PRIV")
 REALITY_PUB=$(printf '%q' "$REALITY_PUB")
 REALITY_SID=$(printf '%q' "$REALITY_SID")
-ANYTLS_PWD=$(printf '%q' "$ANYTLS_PWD")
-SB_MODE=$(printf '%q' "${SB_MODE:-full}")
-SB_SINGLE_PROTO=$(printf '%q' "${SB_SINGLE_PROTO:-vless}")
-SB_SINGLE_PORT=$(printf '%q' "${SB_SINGLE_PORT:-}")
-SB_SINGLE_WARP=$(printf '%q' "${SB_SINGLE_WARP:-0}")
 PORT_VLESS=$(printf '%q' "${PORT_VLESS:-}")
-PORT_ANYTLS=$(printf '%q' "${PORT_ANYTLS:-}")
-PORT_VLESS_W=$(printf '%q' "${PORT_VLESS_W:-}")
-PORT_ANYTLS_W=$(printf '%q' "${PORT_ANYTLS_W:-}")
 SB_ALLOW_PRIVATE=$(printf '%q' "$SB_ALLOW_PRIVATE")
-ENABLE_WARP=$(printf '%q' "$ENABLE_WARP")
 INSTALLED_AT=$(printf '%q' "$(iso_now)")
 EOF
 }
@@ -925,56 +619,28 @@ load_sb_state() {
     [[ -f "$SB_STATE" ]] || die "没有找到安装状态：${SB_STATE}"
     # shellcheck disable=SC1090
     source "$SB_STATE"
-    [[ -f "$SB_WARP_ENV" ]] && { # shellcheck disable=SC1090
-        source "$SB_WARP_ENV"
-    }
-    if [[ -f "${SB_DIR}/wgcf/wgcf-account.toml" ]]; then
-        if [[ "${WARP_RESERVED_1:-0}" == "0" && "${WARP_RESERVED_2:-0}" == "0" && "${WARP_RESERVED_3:-0}" == "0" ]]; then
-            local cid_res
-            if cid_res="$(parse_warp_client_id "${SB_DIR}/wgcf/wgcf-account.toml")"; then
-                IFS=' ' read -r WARP_RESERVED_1 WARP_RESERVED_2 WARP_RESERVED_3 <<< "$cid_res"
-                save_warp_env
-            fi
-        fi
-    fi
     migrate_legacy_state
 }
 
 migrate_legacy_state() {
     SB_DID_MIGRATE=0
-    # Fields added in STATE_VERSION 3; older state files simply default to full.
-    SB_MODE="${SB_MODE:-full}"
-    SB_SINGLE_PROTO="${SB_SINGLE_PROTO:-vless}"
-    SB_SINGLE_PORT="${SB_SINGLE_PORT:-}"
-    SB_SINGLE_WARP="${SB_SINGLE_WARP:-0}"
-
-    case "${STATE_VERSION:-1}" in
-        2|3)
-            if [[ -n "${ANYTLS_PWD:-}" ]]; then
-                if [[ "$SB_MODE" == "single" ]]; then
-                    [[ -n "$SB_SINGLE_PORT" ]] && return 0
-                elif [[ -n "${PORT_ANYTLS:-}" ]]; then
-                    return 0
-                fi
-            fi
-            ;;
-    esac
+    if [[ "${STATE_VERSION:-1}" == "4" && -n "${PORT_VLESS:-}" ]]; then
+        return 0
+    fi
 
     SB_DID_MIGRATE=1
-    info "检测到旧版 4 协议节点，正在迁移为 VLESS + AnyTLS。"
-    [[ -n "${PORT_VLESS:-}" ]] || PORT_VLESS="$(choose_random_port)"
-    [[ -n "${PORT_ANYTLS:-}" ]] || PORT_ANYTLS="$(choose_random_port)"
-    [[ -n "${PORT_VLESS_W:-}" ]] || PORT_VLESS_W="$(choose_random_port)"
-    [[ -n "${PORT_ANYTLS_W:-}" ]] || PORT_ANYTLS_W="$(choose_random_port)"
-    [[ -n "${ANYTLS_PWD:-}" ]] || ANYTLS_PWD="$(random_hex 16)"
-    if [[ "$SB_MODE" == "single" && -z "$SB_SINGLE_PORT" ]]; then
-        SB_SINGLE_PORT="$(choose_random_port)"
+    info "检测到旧版节点布局，正在迁移为单入站 VLESS Reality。"
+    if [[ -z "${PORT_VLESS:-}" ]]; then
+        if [[ -n "${SB_SINGLE_PORT:-}" ]]; then
+            PORT_VLESS="$SB_SINGLE_PORT"
+        else
+            PORT_VLESS="$(choose_random_port)" || die "无法分配空闲端口。"
+        fi
     fi
     if [[ -z "${SB_SNI:-}" || "$SB_SNI" == "www.microsoft.com" || "${SB_TLS_SNI:-}" == "www.bing.com" ]]; then
         SB_SNI="www.tokyometro.jp"
     fi
-    ENABLE_WARP="${ENABLE_WARP:-true}"
-    STATE_VERSION=3
+    STATE_VERSION=4
 }
 
 write_sb_init() {
@@ -1009,8 +675,8 @@ apply_singbox_config() {
     local tmp_conf conf_bak
     ensure_singbox_binary "${SB_TAG:-latest}"
     ensure_system_user "$SB_USER"
-    ensure_self_signed_cert
     ensure_route_file
+    mkdir -p "$SB_DIR" "$SB_DATA_DIR"
     tmp_conf="$(mktemp "${SB_DIR}/config.json.tmp.XXXXXX")"
     register_temp "$tmp_conf"
     render_singbox_config >"$tmp_conf" || { rm -f "$tmp_conf"; return 1; }
@@ -1025,8 +691,7 @@ apply_singbox_config() {
         cp -a "$SB_CONF" "$conf_bak"
     fi
     install -m 0640 "$tmp_conf" "$SB_CONF"
-    chown "${SB_USER}:${SB_USER}" "$SB_CONF" "$SB_DIR" "$SB_DATA_DIR" "$SB_CERT_DIR" \
-        "${SB_CERT_DIR}/key.pem" "${SB_CERT_DIR}/cert.pem" 2>/dev/null || true
+    chown "${SB_USER}:${SB_USER}" "$SB_CONF" "$SB_DIR" "$SB_DATA_DIR" 2>/dev/null || true
     write_sb_state
     write_share_links
     write_sb_init
@@ -1045,23 +710,31 @@ apply_singbox_config() {
 
 print_links() {
     [[ -f "$SB_LINKS" ]] || die "尚未安装，或分享链接不存在。"
-    local count
-    count="$(grep -c '://' "$SB_LINKS" 2>/dev/null || true)"
-    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    if [[ -f "$SB_STATE" ]] && [[ -z "${PORT_VLESS:-}" || -z "${UUID:-}" ]]; then
+        load_sb_state
+        apply_if_legacy_layout
+    fi
     echo
     printf '%ssing-box 分享链接%s\n' "$C_BOLD" "$C_RESET"
     cat "$SB_LINKS"
     echo
     info "完整副本：${SB_LINKS}"
-    if grep -q '^anytls://' "$SB_LINKS"; then
-        warn "AnyTLS 使用自签证书，客户端需允许 insecure。"
-    fi
-    warn "云安全组 / NAT 映射请放行上面这 ${count} 个 TCP 端口。"
+    warn "云安全组 / NAT 映射请放行 TCP ${PORT_VLESS}。"
+}
+
+apply_if_legacy_layout() {
+    ((SB_DID_MIGRATE == 1)) || return 0
+    info "正在按新方案重建配置（单入站 VLESS Reality）..."
+    singbox_prepare
+    ensure_singbox_binary "${SB_TAG:-latest}"
+    apply_singbox_config || die "迁移后启动失败。"
+    ok "已迁移到单入站 VLESS Reality。"
 }
 
 require_installed() {
     [[ -f "$SB_STATE" ]] || die "尚未安装，请先选择安装。"
     load_sb_state
+    apply_if_legacy_layout
     if [[ ! -x "$SB_BIN" ]] || ! service_is_active "$SB_SERVICE"; then
         info "检测到历史配置但程序或服务未就绪，正在恢复..."
         singbox_prepare
@@ -1070,38 +743,15 @@ require_installed() {
     fi
 }
 
-# A port already held by one of our own inbounds is not a conflict.
 port_is_ours() {
-    local port="$1" p
-    for p in "${SB_SINGLE_PORT:-}" "${PORT_VLESS:-}" "${PORT_ANYTLS:-}" \
-             "${PORT_VLESS_W:-}" "${PORT_ANYTLS_W:-}"; do
-        [[ -n "$p" && "$p" == "$port" ]] && return 0
-    done
-    return 1
+    local port="$1"
+    [[ -n "${PORT_VLESS:-}" && "$PORT_VLESS" == "$port" ]]
 }
 
-# Switch the in-memory state to one inbound on one port. Credentials are kept.
-# Empty proto / port / warp mean "keep whatever the current single node uses".
-apply_single_node_settings() {
-    local proto="${1:-}" port="${2:-}" want_warp="${3:-}"
-    local already_single=0 normalized
-
-    [[ "${SB_MODE:-full}" == "single" ]] && already_single=1
-
-    if [[ -z "$proto" ]]; then
-        if ((already_single == 1)); then proto="${SB_SINGLE_PROTO:-vless}"; else proto="vless"; fi
-    fi
-    if [[ -z "$want_warp" ]]; then
-        if ((already_single == 1)); then want_warp="${SB_SINGLE_WARP:-0}"; else want_warp=0; fi
-    fi
-
-    normalized="$(normalize_single_proto "$proto")" || { warn "协议无效：${proto}"; return 1; }
+apply_listen_port() {
+    local port="${1:-}"
     if [[ -z "$port" ]]; then
-        if ((already_single == 1)) && [[ -n "${SB_SINGLE_PORT:-}" ]]; then
-            port="$SB_SINGLE_PORT"
-        else
-            port="$(choose_random_port)" || { warn "无法分配空闲端口。"; return 1; }
-        fi
+        port="$(choose_random_port)" || { warn "无法分配空闲端口。"; return 1; }
     else
         is_valid_port "$port" || { warn "端口无效：${port}"; return 1; }
         port=$((10#$port))
@@ -1110,90 +760,45 @@ apply_single_node_settings() {
             return 1
         fi
     fi
-
-    if [[ "$want_warp" == "1" ]] && ! warp_ready; then
-        ENABLE_WARP=true
-        ensure_warp_profile || true
-    fi
-    if [[ "$want_warp" == "1" ]] && ! warp_ready; then
-        warn "WARP 未就绪，单节点改用直连出口。"
-        want_warp=0
-    fi
-
-    SB_MODE="single"
-    SB_SINGLE_PROTO="$normalized"
-    SB_SINGLE_PORT="$port"
-    SB_SINGLE_WARP="$want_warp"
+    PORT_VLESS="$port"
 }
 
-apply_full_node_settings() {
-    local ports
-    ports="$(choose_unique_ports 4)" || { warn "无法分配 4 个空闲端口。"; return 1; }
-    # shellcheck disable=SC2206
-    local -a pa=($ports)
-    PORT_VLESS="${pa[0]}"
-    PORT_ANYTLS="${pa[1]}"
-    PORT_VLESS_W="${pa[2]}"
-    PORT_ANYTLS_W="${pa[3]}"
-    SB_MODE="full"
-}
-
-prompt_single_node() {
-    local answer port
-    SBP_SINGLE_PROTO=""
-    SBP_SINGLE_PORT=""
-    SBP_SINGLE_WARP=0
-
-    echo "  1) VLESS Reality"
-    echo "  2) AnyTLS"
-    ask answer "选择协议 [1]: "
-    case "${answer:-1}" in
-        1|"") SBP_SINGLE_PROTO="vless" ;;
-        2) SBP_SINGLE_PROTO="anytls" ;;
-        *) warn "无效协议选择"; return 1 ;;
-    esac
-
+prompt_listen_port() {
+    local port=""
     ask port "监听端口（留空随机，NAT 请填已映射的端口）: "
     if [[ -n "$port" ]]; then
         is_valid_port "$port" || { warn "端口无效：${port}"; return 1; }
-        SBP_SINGLE_PORT=$((10#$port))
-    fi
-
-    if confirm "该节点出口走 WARP？" "n"; then
-        SBP_SINGLE_WARP=1
+        printf '%s\n' "$((10#$port))"
     fi
 }
 
 singbox_single_entry() {
     require_root
     echo
-    title "单节点（指定端口，适配 NAT）"
-    dim "只监听一个端口，适合只有少量映射端口的 NAT 小鸡。"
-    prompt_single_node || return 1
+    title "指定端口（适配 NAT）"
+    dim "只监听一个 VLESS Reality 端口，适合只有少量映射端口的 NAT 小鸡。"
+    local port
+    port="$(prompt_listen_port)" || return 1
 
     if [[ -f "$SB_STATE" ]]; then
         singbox_prepare
         load_sb_state
         ensure_singbox_binary "${SB_TAG:-latest}"
-        apply_single_node_settings "$SBP_SINGLE_PROTO" "$SBP_SINGLE_PORT" "$SBP_SINGLE_WARP" || return 1
+        apply_listen_port "$port" || return 1
         apply_singbox_config || { warn "应用失败。"; return 1; }
-        ok "已切换为单节点：${SB_SINGLE_PROTO} :${SB_SINGLE_PORT}"
+        ok "已更新监听端口：${PORT_VLESS}"
         print_links
         return 0
     fi
 
-    local -a args=(--single "$SBP_SINGLE_PROTO")
-    if [[ -n "$SBP_SINGLE_PORT" ]]; then
-        args+=(--port "$SBP_SINGLE_PORT")
-    fi
-    if [[ "$SBP_SINGLE_WARP" == "1" ]]; then
-        args+=(--single-warp)
+    local -a args=()
+    if [[ -n "$port" ]]; then
+        args+=(--port "$port")
     fi
     singbox_install "${args[@]}"
 }
 
 singbox_install() {
-    local ports
     while (($#)); do
         case "$1" in
             -H|--host) (($# >= 2)) || die "--host 缺少参数"; SB_HOST="$2"; shift 2 ;;
@@ -1201,21 +806,22 @@ singbox_install() {
             --tls-sni) (($# >= 2)) || die "--tls-sni 缺少参数"; SB_SNI="$2"; shift 2 ;;
             --version) (($# >= 2)) || die "--version 缺少参数"; SB_TAG="$2"; shift 2 ;;
             --allow-private) SB_ALLOW_PRIVATE=1; shift ;;
-            --no-warp) ENABLE_WARP=false; shift ;;
+            --no-warp|--single-warp)
+                die "已移除 WARP 支持（$1 不再可用）。"
+                ;;
             --single|--single-node)
-                (($# >= 2)) || die "--single 缺少参数（vless 或 anytls）"
-                CLI_SINGLE_PROTO="$(normalize_single_proto "$2")" || die "--single 只支持 vless 或 anytls：$2"
-                CLI_SINGLE=1
-                shift 2
+                case "${2:-}" in
+                    vless|reality|vless-reality) shift 2 ;;
+                    anytls|anytls-tls) die "当前仅支持 VLESS Reality，已不再提供 AnyTLS 入站。" ;;
+                    *) shift ;;
+                esac
                 ;;
             -p|--port)
                 (($# >= 2)) || die "--port 缺少参数"
                 is_valid_port "$2" || die "端口无效：$2"
-                CLI_SINGLE_PORT=$((10#$2))
-                CLI_SINGLE=1
+                CLI_PORT=$((10#$2))
                 shift 2
                 ;;
-            --single-warp) CLI_SINGLE_WARP=1; CLI_SINGLE=1; shift ;;
             -f|--force) CLI_FORCE=1; shift ;;
             -h|--help) singbox_usage; return 0 ;;
             *) die "未知 install 参数：$1" ;;
@@ -1231,21 +837,19 @@ singbox_install() {
     if [[ -f "$SB_STATE" && "$CLI_FORCE" -ne 1 ]]; then
         load_sb_state
         ensure_singbox_binary "$SB_TAG"
-        if ((CLI_SINGLE == 1)); then
-            info "正在切换为单节点模式（保留现有凭证）..."
-            apply_single_node_settings "$CLI_SINGLE_PROTO" "$CLI_SINGLE_PORT" "$CLI_SINGLE_WARP" \
-                || die "单节点切换失败。"
-            apply_singbox_config || die "单节点配置应用失败。"
-            ok "已切换为单节点：${SB_SINGLE_PROTO} :${SB_SINGLE_PORT}"
+        if [[ -n "$CLI_PORT" ]]; then
+            info "正在更新监听端口（保留现有凭证）..."
+            apply_listen_port "$CLI_PORT" || die "端口更新失败。"
+            apply_singbox_config || die "配置应用失败。"
+            ok "监听端口：${PORT_VLESS}"
             print_links
             return 0
         fi
         if ((SB_DID_MIGRATE == 1)); then
             info "正在按新方案重建配置（保留 VLESS 凭证）..."
             ensure_system_user "$SB_USER"
-            ensure_warp_profile || true
             apply_singbox_config || die "迁移后启动失败。"
-            ok "已迁移到 VLESS + AnyTLS。"
+            ok "已迁移到单入站 VLESS Reality。"
             print_links
             return 0
         fi
@@ -1258,7 +862,6 @@ singbox_install() {
             if ! service_is_active "$SB_SERVICE"; then
                 info "检测到历史配置但服务未运行，正在重新应用并启动服务..."
                 ensure_system_user "$SB_USER"
-                ensure_warp_profile || true
                 apply_singbox_config || die "启动失败。"
                 ok "sing-box 已恢复并启动。"
             else
@@ -1269,47 +872,26 @@ singbox_install() {
         fi
     fi
 
-    mkdir -p "$SB_DIR" "$SB_DATA_DIR" "$SB_CERT_DIR"
+    mkdir -p "$SB_DIR" "$SB_DATA_DIR"
     ensure_system_user "$SB_USER"
     ensure_route_file
     download_singbox "$SB_TAG"
-    ensure_warp_profile || true
 
-    if ((CLI_SINGLE == 1)); then
-        SB_MODE="single"
-        SB_SINGLE_PROTO="${CLI_SINGLE_PROTO:-vless}"
-        SB_SINGLE_WARP="${CLI_SINGLE_WARP:-0}"
-        if [[ -n "$CLI_SINGLE_PORT" ]]; then
-            if port_in_use "$CLI_SINGLE_PORT"; then
-                die "端口 ${CLI_SINGLE_PORT} 已被占用，请换一个。"
-            fi
-            SB_SINGLE_PORT="$CLI_SINGLE_PORT"
-        else
-            SB_SINGLE_PORT="$(choose_random_port)" || die "无法分配空闲端口。"
+    if [[ -n "$CLI_PORT" ]]; then
+        if port_in_use "$CLI_PORT"; then
+            die "端口 ${CLI_PORT} 已被占用，请换一个。"
         fi
-        if [[ "$SB_SINGLE_WARP" == "1" ]] && ! warp_ready; then
-            warn "WARP 未就绪，单节点改用直连出口。"
-            SB_SINGLE_WARP=0
-        fi
-        PORT_VLESS=""; PORT_ANYTLS=""; PORT_VLESS_W=""; PORT_ANYTLS_W=""
+        PORT_VLESS="$CLI_PORT"
     else
-        SB_MODE="full"
-        ports="$(choose_unique_ports 4)"
-        # shellcheck disable=SC2206
-        local -a port_arr=($ports)
-        PORT_VLESS="${port_arr[0]}"
-        PORT_ANYTLS="${port_arr[1]}"
-        PORT_VLESS_W="${port_arr[2]}"
-        PORT_ANYTLS_W="${port_arr[3]}"
+        PORT_VLESS="$(choose_random_port)" || die "无法分配空闲端口。"
     fi
 
     UUID="$(generate_uuid)"
-    ANYTLS_PWD="$(random_hex 16)"
     REALITY_SID="$(random_hex 8)"
     local kp
     kp="$("$SB_BIN" generate reality-keypair)" || die "无法生成 Reality 密钥对。"
     parse_reality_keypair "$kp" || die "无法解析 Reality 密钥对。"
-    STATE_VERSION=3
+    STATE_VERSION=4
 
     touch "$SB_LOG"
     chown "${SB_USER}:${SB_USER}" "$SB_LOG" 2>/dev/null || true
@@ -1353,30 +935,10 @@ singbox_status() {
     fi
     if [[ -f "$SB_STATE" ]]; then
         load_sb_state
+        apply_if_legacy_layout
         echo "SNI:          ${SB_SNI}"
-        if [[ "${SB_MODE:-full}" == "single" ]]; then
-            echo "模式:         单节点（NAT）"
-            echo "协议:         ${SB_SINGLE_PROTO}"
-            echo "端口:         ${SB_SINGLE_PORT}"
-            if [[ "${SB_SINGLE_WARP:-0}" == "1" ]] && warp_ready; then
-                echo "出口:         WARP"
-            else
-                echo "出口:         直连"
-            fi
-        else
-            echo "模式:         多节点"
-            echo "VLESS:        ${PORT_VLESS}"
-            echo "AnyTLS:       ${PORT_ANYTLS}"
-            if warp_ready; then
-                echo "VLESS-WARP:   ${PORT_VLESS_W}"
-                echo "AnyTLS-WARP:  ${PORT_ANYTLS_W}"
-            fi
-        fi
-        if warp_ready; then
-            echo "WARP:         已启用 ${WARP_ENDPOINT_HOST}:${WARP_ENDPOINT_PORT}"
-        else
-            echo "WARP:         未启用"
-        fi
+        echo "协议:         VLESS Reality"
+        echo "端口:         ${PORT_VLESS}"
     fi
 }
 
@@ -1385,6 +947,11 @@ singbox_restart() {
     require_openrc
     if [[ ! -f "$SB_STATE" ]]; then
         die "尚未安装，请先选择安装。"
+    fi
+    load_sb_state
+    if ((SB_DID_MIGRATE == 1)); then
+        apply_if_legacy_layout
+        return 0
     fi
     if [[ ! -x "$SB_BIN" || ! -f "$SB_INIT" ]]; then
         info "检测到程序或服务未就绪，正在重新应用并启动服务..."
@@ -1455,10 +1022,9 @@ select_route_outbound() {
     ip6="$(default_ipv6_address || true)"
     mapfile -t imported < <(jq -r '.outbounds[]?.tag' "$SB_ROUTE_JSON")
     echo "选择这条规则使用的出口："
-    echo "  1) 本机 WARP（warp）"
-    echo "  2) 本机 IPv4（direct-ipv4，当前 ${ip4:-未检测到}）"
-    echo "  3) 本机 IPv6（direct-ipv6，当前 ${ip6:-未检测到}）"
-    idx=4
+    echo "  1) 本机 IPv4（direct-ipv4，当前 ${ip4:-未检测到}）"
+    echo "  2) 本机 IPv6（direct-ipv6，当前 ${ip6:-未检测到}）"
+    idx=3
     for tag in "${imported[@]:-}"; do
         [[ -n "$tag" ]] || continue
         echo "  ${idx}) 导入出口：${tag}"
@@ -1466,12 +1032,11 @@ select_route_outbound() {
     done
     ask choice "选择出口: "
     case "$choice" in
-        1) SBP_SELECTED_OUTBOUND="warp" ;;
-        2) SBP_SELECTED_OUTBOUND="direct-ipv4" ;;
-        3) SBP_SELECTED_OUTBOUND="direct-ipv6" ;;
+        1) SBP_SELECTED_OUTBOUND="direct-ipv4" ;;
+        2) SBP_SELECTED_OUTBOUND="direct-ipv6" ;;
         *)
             if [[ "$choice" =~ ^[0-9]+$ ]]; then
-                idx=$((choice - 4))
+                idx=$((choice - 3))
                 if ((idx >= 0 && idx < ${#imported[@]})); then
                     SBP_SELECTED_OUTBOUND="${imported[$idx]}"
                 fi
@@ -1515,7 +1080,7 @@ import_custom_route_outbound() {
     ask tag "远程出口 tag（例如 hk-socks）: "
     valid_route_tag "$tag" || { warn "tag 只能包含字母数字和 ._-@!"; return 1; }
     case "$tag" in
-        direct|direct-ipv4|direct-ipv6|warp) warn "该 tag 是内置出口。"; return 1 ;;
+        direct|direct-ipv4|direct-ipv6|warp) warn "该 tag 是保留名称。"; return 1 ;;
     esac
     echo "粘贴分享链接（优先 socks5h://user:pass@host:port），也支持 VLESS / AnyTLS / SOCKS / HTTP。"
     ask raw "节点配置: "
@@ -1605,19 +1170,12 @@ singbox_edit() {
         echo
         title "编辑节点信息"
         echo "  入口: ${SB_HOST:-自动探测}   SNI: ${SB_SNI}"
-        if [[ "${SB_MODE:-full}" == "single" ]]; then
-            echo "  单节点 ${SB_SINGLE_PROTO} :${SB_SINGLE_PORT}  WARP=$(warp_ready && echo 开 || echo 关)"
-        else
-            echo "  VLESS ${PORT_VLESS}  AnyTLS ${PORT_ANYTLS}  WARP=$(warp_ready && echo 开 || echo 关)"
-        fi
+        echo "  VLESS Reality :${PORT_VLESS}"
         echo
         echo "  1) 修改入口地址（NAT / 域名）"
         echo "  2) 修改 SNI / Reality 握手域名"
-        echo "  3) 多节点模式（随机 4 端口）"
-        echo "  4) 单节点模式（指定端口，适配 NAT）"
-        echo "  5) 重新生成 UUID / 密钥 / AnyTLS 密码"
-        echo "  6) 重试 / 启用 WARP"
-        echo "  7) 关闭 WARP 节点"
+        echo "  3) 修改监听端口"
+        echo "  4) 重新生成 UUID / 密钥"
         echo "  0) 返回"
         local op val
         ask op "请选择: "
@@ -1633,13 +1191,18 @@ singbox_edit() {
                 ask val "SNI（当前 ${SB_SNI}）: "
                 is_valid_host "$val" || { warn "SNI 无效"; pause; continue; }
                 SB_SNI="$val"
-                ensure_self_signed_cert 1
-                apply_singbox_config && ok "已更新 SNI 并重签证书。" || warn "应用失败。"
+                apply_singbox_config && ok "已更新 SNI。" || warn "应用失败。"
                 pause
                 ;;
             3)
-                if apply_full_node_settings && apply_singbox_config; then
-                    ok "已切换为多节点并更换端口。"
+                ask val "监听端口（当前 ${PORT_VLESS}）: "
+                if [[ -z "$val" ]]; then
+                    info "未更改。"
+                    pause
+                    continue
+                fi
+                if apply_listen_port "$val" && apply_singbox_config; then
+                    ok "监听端口：${PORT_VLESS}"
                     print_links
                 else
                     warn "应用失败。"
@@ -1647,34 +1210,13 @@ singbox_edit() {
                 pause
                 ;;
             4)
-                singbox_single_entry || true
-                pause
-                ;;
-            5)
                 UUID="$(generate_uuid)"
-                ANYTLS_PWD="$(random_hex 16)"
                 REALITY_SID="$(random_hex 8)"
                 local kp
                 kp="$("$SB_BIN" generate reality-keypair)" || { warn "生成密钥失败"; pause; continue; }
                 parse_reality_keypair "$kp" || { warn "解析密钥失败"; pause; continue; }
                 apply_singbox_config && ok "凭证已轮换。" || warn "应用失败。"
                 print_links
-                pause
-                ;;
-            6)
-                ENABLE_WARP=true
-                if ensure_warp_profile && apply_singbox_config; then
-                    ok "WARP 已启用。"
-                    print_links
-                else
-                    warn "WARP 未能启用。"
-                fi
-                pause
-                ;;
-            7)
-                ENABLE_WARP=false
-                SB_SINGLE_WARP=0
-                apply_singbox_config && ok "已关闭 WARP 入站。" || warn "应用失败。"
                 pause
                 ;;
             0|q|Q) return 0 ;;
@@ -1687,10 +1229,10 @@ singbox_menu() {
     while true; do
         echo
         printf '%sAlpine sing-box  v%s%s\n' "$C_BLUE" "$SB_VERSION_LABEL" "$C_RESET"
-        dim "VLESS Reality · AnyTLS · WARP · 自定义分流"
+        dim "VLESS Reality · 自定义分流"
         echo "────────────────────────────────────────"
-        echo "  1) 安装 / 覆盖重装（多节点，随机端口）"
-        echo "  2) 单节点（指定端口，适配 NAT）"
+        echo "  1) 安装 / 覆盖重装（随机端口）"
+        echo "  2) 指定端口（适配 NAT）"
         echo "  3) 查看分享链接"
         echo "  4) 运行状态"
         echo "  5) 启动 / 重启服务"

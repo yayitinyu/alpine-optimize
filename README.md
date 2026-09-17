@@ -67,16 +67,16 @@ bash /opt/alpine-optimize/alpine.sh self-update
 | 1 | 系统优化分项：BBR、limits、SWAP、磁盘、工具、清理、引导、时间、熵源 |
 | 2 | Realm 端口转发（OpenRC，官方 musl 包） |
 | 3 | Dante SOCKS5 |
-| 4 | sing-box：VLESS Reality + AnyTLS，可选 WARP，自定义分流 / socks5h 导入 |
+| 4 | sing-box：VLESS Reality，自定义分流 / socks5h 导入 |
 | 5 | SSH 密钥（可选关密码，默认否） |
 | 6 | 查看优化与服务状态 |
 | 7 | 卸载优化配置 |
 
 一键优化包含：community 源、GNU 工具、BBR+网络、资源限制、SWAP、noatime、运维工具、每日清理、chrony、haveged。
 
-sing-box 入站为 **VLESS Reality** 与 **AnyTLS**（直连 + WARP 各一条）。可在菜单里改 SNI、端口、凭证，并导入 `socks5h://` 等远程出口做分流。默认 Reality / AnyTLS SNI 为 `www.tokyometro.jp`。
+sing-box 入站为一条 **VLESS Reality**。可在菜单里改 SNI、端口、凭证，并导入 `socks5h://` 等远程出口做分流。默认 Reality SNI 为 `www.tokyometro.jp`。
 
-只有少量映射端口的 **NAT 小鸡**，可用子菜单 `2) 单节点` 或 `install --single`：只开一个入站、端口自选，其余节点不再占用端口。已安装时切换会保留原有 UUID / Reality 密钥 / AnyTLS 密码。
+只有少量映射端口的 **NAT 小鸡**，可用子菜单 `2) 指定端口` 或 `install --port`：入站端口自选。已安装时改端口会保留原有 UUID 与 Reality 密钥。
 
 ---
 
@@ -90,7 +90,7 @@ bash alpine.sh optimize --bbr --bandwidth 1000 --region asia -y
 bash alpine.sh realm install --listen 23456 --remote 1.1.1.1:443
 bash alpine.sh socks install --port 35678 --host nat.example.com
 bash alpine.sh sing-box install --host nat.example.com
-bash alpine.sh sing-box install --single vless --port 45678 --host nat.example.com
+bash alpine.sh sing-box install --port 45678 --host nat.example.com
 bash alpine.sh status
 bash alpine.sh self-update
 bash alpine.sh uninstall
@@ -131,7 +131,7 @@ bash alpine.sh sing-box --help
 - BBR 依赖内核提供 `tcp_bbr`。云主机优先 `linux-virt`；看不到 bbr 时先换内核再 reboot。
 - LXC / OpenVZ / 多数容器里，内核参数由宿主机控制，脚本会跳过 SWAP、网卡和模块加载。
 - 脚本**不会**擅自启用原本关闭的防火墙，也改不了云安全组。
-- SOCKS5 用户名密码不加密传输；sing-box 的 HY2/TUIC 使用自签证书。
+- SOCKS5 用户名密码不加密传输。
 
 本地静态检查：
 
